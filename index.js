@@ -247,7 +247,7 @@ flags: 64
     }
   }
 });
-client.once("ready", () => {
+client.once("clientReady", () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
   hitlistCommand.startTracker(client);
