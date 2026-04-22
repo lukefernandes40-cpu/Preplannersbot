@@ -144,11 +144,12 @@ client.on("interactionCreate", async interaction => {
       components: getRows()
     });
 
-    activeRaids.set(channel.id, {
-      owner: interaction.user.id,
-      data,
-      messageId: msg.id
-    });
+activeRaids.set(channel.id, {
+  owner: interaction.user.id,
+  data,
+  messageId: msg.id,
+  lastPing: 0
+});
 
     return interaction.editReply({ content: `✅ Created <#${channel.id}>` });
   }
@@ -174,22 +175,35 @@ client.on("interactionCreate", async interaction => {
     if (!raid) return;
 
     // ===== RAID PING =====
-    if (interaction.customId === "raid_ping") {
-  const member = await interaction.guild.members.fetch(interaction.user.id);
+if (interaction.customId === "raid_ping") {
 
-  // Give role
-await interaction.deferReply({ ephemeral: true });
+  const now = Date.now();
+  const cooldown = 3 * 60 * 1000;
 
-await interaction.channel.send({
-  content: `🚨 RAID ALERT <@&${process.env.RAID_ROLE_ID}>`,
-  allowedMentions: {
-    roles: [process.env.RAID_ROLE_ID]
+  if (now - raid.lastPing < cooldown) {
+const remainingMs = cooldown - (now - raid.lastPing);
+
+const minutes = Math.floor(remainingMs / 60000);
+const seconds = Math.ceil((remainingMs % 60000) / 1000);
+    return interaction.reply({
+content: `⏳ Wait ${minutes}m ${seconds}s before pinging again.`,      
+flags: 64
+    });
   }
-});
 
-return interaction.editReply({ content: "✅ Raid Ping Sent" });
+  raid.lastPing = now;
+
+  await interaction.deferReply({ ephemeral: true });
+
+  await interaction.channel.send({
+    content: `🚨 RAID ALERT <@&${process.env.RAID_ROLE_ID}>`,
+    allowedMentions: {
+      roles: [process.env.RAID_ROLE_ID]
     }
+  });
 
+  return interaction.editReply({ content: "✅ Raid Ping Sent" });
+}
 
     // ===== END RAID =====
     if (interaction.customId === "end_raid") {
