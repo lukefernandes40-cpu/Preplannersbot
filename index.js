@@ -1,12 +1,11 @@
 // ===== KEEP SERVER ALIVE =====
+require("dotenv").config();
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
-
+const hitlistCommand = require("./hitlist");
 app.get("/", (req, res) => res.send("Bot is running"));
 app.listen(PORT, () => console.log(`🌐 Server running on ${PORT}`));
-
-require("dotenv").config();
 
 const {
   Client,
@@ -42,7 +41,9 @@ const activeRaids = new Map();
 const commands = [
   new SlashCommandBuilder()
     .setName("raid")
-    .setDescription("Create raid ticket")
+    .setDescription("Create raid ticket"),
+
+  hitlistCommand.data
 ];
 
 const rest = new REST({ version: "10" }).setToken(process.env.TOKEN);
@@ -92,28 +93,38 @@ function getRows() {
 // ===== INTERACTIONS =====
 client.on("interactionCreate", async interaction => {
 
-  // ===== COMMAND =====
-  if (interaction.isChatInputCommand() && interaction.commandName === "raid") {
-    const modal = new ModalBuilder()
-      .setCustomId("raid_modal")
-      .setTitle("⚔ Raid Setup");
+  // ===== SLASH COMMAND HANDLER =====
+  if (interaction.isChatInputCommand()) {
 
-    const fields = ["region", "allies", "enemies", "link"];
+    // HITLIST
+    if (interaction.commandName === "hitlist") {
+      return hitlistCommand.execute(interaction);
+    }
 
-    modal.addComponents(
-      ...fields.map(f =>
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder()
-            .setCustomId(f)
-            .setLabel(f.toUpperCase())
-            .setStyle(TextInputStyle.Short)
+    // RAID
+    if (interaction.commandName === "raid") {
+      const modal = new ModalBuilder()
+        .setCustomId("raid_modal")
+        .setTitle("⚔ Raid Setup");
+
+      const fields = ["region", "allies", "enemies", "link"];
+
+      modal.addComponents(
+        ...fields.map(f =>
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId(f)
+              .setLabel(f.toUpperCase())
+              .setStyle(TextInputStyle.Short)
+          )
         )
-      )
-    );
+      );
 
-    return interaction.showModal(modal);
+      return interaction.showModal(modal);
+    }
+
+    return;
   }
-
   // ===== CREATE RAID =====
   if (interaction.isModalSubmit() && interaction.customId === "raid_modal") {
 
@@ -236,7 +247,11 @@ flags: 64
     }
   }
 });
+client.once("ready", () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
 
+  hitlistCommand.startTracker(client);
+});
 // ===== LOGIN =====
 client.login(process.env.TOKEN);
 
