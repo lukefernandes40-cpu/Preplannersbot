@@ -80,6 +80,7 @@ client.once("ready", () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   hitlistCommand.startTracker(client);
   raid.startRefresh(client);
+  accountSystem.syncAllEmbeds(client);
 });
 
 // ===== LOGIN =====

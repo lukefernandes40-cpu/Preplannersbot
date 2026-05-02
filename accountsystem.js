@@ -15,7 +15,11 @@ const DB_FILE = "./accounts.json";
 // ===== DB =====
 function loadDB() {
   if (!fs.existsSync(DB_FILE)) return [];
-  return JSON.parse(fs.readFileSync(DB_FILE));
+  try {
+    return JSON.parse(fs.readFileSync(DB_FILE));
+  } catch {
+    return [];
+  }
 }
 
 function saveDB(data) {
@@ -62,6 +66,30 @@ function getButtons(acc) {
       .setLabel("🗑️ Delete")
       .setStyle(ButtonStyle.Danger)
   );
+}
+
+// ===== SYNC EMBED (edit existing message in place) =====
+async function syncEmbed(client, acc) {
+  try {
+    const channel = await client.channels.fetch(acc.channelId).catch(() => null);
+    if (!channel) return;
+    const msg = await channel.messages.fetch(acc.messageId).catch(() => null);
+    if (!msg) return;
+
+    // Fetch display name of owner if there is one
+    let displayName = null;
+    if (acc.owner) {
+      const member = await channel.guild.members.fetch(acc.owner).catch(() => null);
+      displayName = member?.displayName || null;
+    }
+
+    await msg.edit({
+      embeds: [buildAccountEmbed(acc, false, displayName)],
+      components: [getButtons(acc)]
+    });
+  } catch (e) {
+    console.log("syncEmbed error:", e);
+  }
 }
 
 // ===== COMMAND =====
@@ -138,17 +166,8 @@ module.exports = {
     acc.password = interaction.fields.getTextInputValue("password");
     saveDB(db);
 
-    // Always update the public message with password hidden
-    const channel = await interaction.client.channels.fetch(acc.channelId).catch(() => null);
-    if (channel) {
-      const msg = await channel.messages.fetch(acc.messageId).catch(() => null);
-      if (msg) {
-        await msg.edit({
-          embeds: [buildAccountEmbed(acc, false)],
-          components: [getButtons(acc)]
-        });
-      }
-    }
+    // Edit the public embed in place, password always hidden
+    await syncEmbed(interaction.client, acc);
 
     // Show the new password only to the editor via ephemeral
     return interaction.reply({
@@ -178,7 +197,7 @@ module.exports = {
       acc.owner = interaction.user.id;
       saveDB(db);
 
-      // Public message always hides password
+      // Edit the public embed in place, password always hidden
       await interaction.update({
         embeds: [buildAccountEmbed(acc, false, displayName)],
         components: [getButtons(acc)]
@@ -204,7 +223,7 @@ module.exports = {
       acc.owner = null;
       saveDB(db);
 
-      // Public message always hides password
+      // Edit the public embed in place, clear the "Used by" field
       return interaction.update({
         embeds: [buildAccountEmbed(acc, false)],
         components: [getButtons(acc)]
@@ -255,5 +274,20 @@ module.exports = {
       await interaction.message.delete().catch(() => {});
       return interaction.reply({ content: "🗑️ Account deleted", ephemeral: true }).catch(() => {});
     }
+  },
+
+  // ===== STARTUP SYNC =====
+  // Call this from index.js on ready to re-sync all embeds after a Render restart
+  async syncAllEmbeds(client) {
+    const db = loadDB();
+    console.log(`🔄 Syncing ${db.length} account embeds...`);
+
+    for (const acc of db) {
+      await syncEmbed(client, acc);
+      // Small delay to avoid hitting Discord rate limits
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    console.log("✅ Account embeds synced");
   }
 };
