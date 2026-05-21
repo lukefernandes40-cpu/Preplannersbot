@@ -15,20 +15,21 @@ const {
 } = require("discord.js");
 
 const hitlistCommand = require("./hitlist");
-const accountSystem = require("./accountsystem");
-const raid = require("./raid");
+const accountSystem  = require("./accountsystem");
+const raid           = require("./raid");
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMembers
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.MessageContent  // Required for screenshot upload reading
   ]
 });
 
 client.on("error", console.error);
 process.on("unhandledRejection", console.error);
-process.on("uncaughtException", console.error);
+process.on("uncaughtException",  console.error);
 
 // ===== REGISTER COMMANDS =====
 const commands = [
@@ -50,29 +51,52 @@ client.on("interactionCreate", async interaction => {
 
   // ===== SLASH COMMANDS =====
   if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === "raid") return raid.createRaid(interaction);
+    if (interaction.commandName === "raid")    return raid.createRaid(interaction);
     if (interaction.commandName === "hitlist") return hitlistCommand.execute(interaction);
     if (interaction.commandName === "account") return accountSystem.execute(interaction);
     return;
   }
 
   // ===== MODAL SUBMITS =====
-if (interaction.isModalSubmit()) {
-    if (interaction.customId === "raid_modal") return raid.handleRaidModal(interaction);
-    if (interaction.customId.startsWith("edit_raid_")) return raid.handleEditModal(interaction);
-    if (interaction.customId.startsWith("queue_modal_")) return raid.handleQueueModal(interaction); // ← ADD THIS
+  if (interaction.isModalSubmit()) {
+    if (interaction.customId === "raid_modal")            return raid.handleRaidModal(interaction);
+    if (interaction.customId.startsWith("edit_raid_"))    return raid.handleEditModal(interaction);
+    if (interaction.customId.startsWith("queue_modal_"))  return raid.handleQueueModal(interaction);
     if (interaction.customId.startsWith("edit_account_")) return accountSystem.handleModal(interaction);
     return;
   }
 
-  // ===== BUTTONS =====
-  if (interaction.isButton()) {
-    // Try account buttons first
-    await accountSystem.handleButton(interaction);
-
-    // Try raid buttons
-    await raid.handleButton(interaction, client);
+  // ===== USER SELECT MENUS =====
+  if (interaction.isUserSelectMenu()) {
+    await raid.handleSelectMenu(interaction);
+    return;
   }
+
+  // ===== BUTTONS =====
+  // IMPORTANT: try raid buttons first for raid-specific IDs,
+  // then fall through to accountSystem for account buttons.
+  // This prevents accountSystem from consuming the interaction token
+  // before raid.handleButton can respond (which caused Unknown Interaction errors).
+  if (interaction.isButton()) {
+    const raidIds = [
+      "raid_ping", "end_raid", "edit_raid",
+      "member_ingame", "member_queue",
+      "raid_confirm_end", "raid_skip_end", "raid_screenshot_end", "raid_raider_select"
+    ];
+
+    if (raidIds.includes(interaction.customId)) {
+      await raid.handleButton(interaction, client);
+      return;
+    }
+
+    // Everything else goes to accountSystem
+    await accountSystem.handleButton(interaction);
+  }
+});
+
+// ===== MESSAGES =====
+client.on("messageCreate", async message => {
+  await raid.handleMessage(message);
 });
 
 // ===== READY =====
