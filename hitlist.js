@@ -1,7 +1,12 @@
+// ===== HITLIST.JS =====
+// Tracks Roblox users and posts live status embeds.
+// FIX: Profile link always shows. Join link shows when joins are ON (gameId + gameInstanceId present).
+// FIX: When joins are OFF the embed still links the profile and shows TSB link.
+
 const { SlashCommandBuilder, EmbedBuilder } = require("discord.js");
 const noblox = require("noblox.js");
-const fetch = require("node-fetch");
-const fs = require("fs");
+const fetch  = require("node-fetch");
+const fs     = require("fs");
 
 const DB_FILE  = "./hitlist.json";
 const MSG_FILE = "./hitlist_messages.json";
@@ -11,16 +16,13 @@ const TSB_PLACE_ID = 10449761463;
 let trackerRunning = false;
 
 // ===== ANALYTICS STORE =====
-// { userId: { sessions: [{start, end, status}], dailyCounts: {0..6: count} } }
 const analyticsStore = new Map();
-// Track current session start per user
-const sessionStart = new Map(); // userId -> { time, status }
+const sessionStart   = new Map();
 
 // ===== MESSAGE MAP =====
 function loadMessageMap() {
   if (!fs.existsSync(MSG_FILE)) return {};
-  try { return JSON.parse(fs.readFileSync(MSG_FILE)); }
-  catch { return {}; }
+  try { return JSON.parse(fs.readFileSync(MSG_FILE)); } catch { return {}; }
 }
 function saveMessageMap(map) {
   fs.writeFileSync(MSG_FILE, JSON.stringify(map, null, 2));
@@ -29,8 +31,7 @@ function saveMessageMap(map) {
 // ===== DB =====
 function loadDB() {
   if (!fs.existsSync(DB_FILE)) return [];
-  try { return JSON.parse(fs.readFileSync(DB_FILE)); }
-  catch { return []; }
+  try { return JSON.parse(fs.readFileSync(DB_FILE)); } catch { return []; }
 }
 function saveDB(data) {
   fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
@@ -42,7 +43,7 @@ async function getDisplayName(userId) {
   const cached = displayCache.get(userId);
   if (cached && Date.now() - cached.time < 5 * 60 * 1000) return cached.name;
   try {
-    const user = await noblox.getPlayerInfo(userId);
+    const user    = await noblox.getPlayerInfo(userId);
     const display = user.displayName || user.username;
     displayCache.set(userId, { name: display, time: Date.now() });
     return display;
@@ -63,8 +64,7 @@ async function loginRoblox() {
 
 // ===== GET USER ID =====
 async function getUserId(username) {
-  try { return await noblox.getIdFromUsername(username); }
-  catch { return null; }
+  try { return await noblox.getIdFromUsername(username); } catch { return null; }
 }
 
 // ===== FULL PRESENCE =====
@@ -88,8 +88,8 @@ async function getPresenceFull(userId) {
 // ===== STATUS FROM PRESENCE =====
 function presenceToStatus(p) {
   if (!p || p.userPresenceType === 0) return "offline";
-  if (p.userPresenceType === 2) return "in_game";
-  if (p.userPresenceType === 1) return "online";
+  if (p.userPresenceType === 2)       return "in_game";
+  if (p.userPresenceType === 1)       return "online";
   return "offline";
 }
 
@@ -103,29 +103,24 @@ function recordAnalytics(userId, newStatus) {
   }
   const data = analyticsStore.get(userId);
 
-  // Close previous session
   if (prev && prev.status !== "offline" && prev.status !== newStatus) {
     const duration = now - prev.time;
     data.sessions.push({ start: prev.time, end: now, status: prev.status, durationMs: duration });
 
-    // Prune sessions older than 7 days
     const cutoff = now - 7 * 24 * 60 * 60 * 1000;
     data.sessions = data.sessions.filter(s => s.end > cutoff);
 
-    // Track which day of week they were active
-    const day = new Date(prev.time).getDay(); // 0=Sun..6=Sat
+    const day = new Date(prev.time).getDay();
     if (prev.status !== "offline") {
       data.dailyCounts[day] = (data.dailyCounts[day] || 0) + 1;
     }
   }
 
-  // Start new session
   sessionStart.set(userId, { time: now, status: newStatus });
 }
 
 // ===== AVATAR CACHE =====
-const avatarCache = new Map(); // userId -> { url, time }
-
+const avatarCache = new Map();
 async function getAvatarUrl(userId) {
   const cached = avatarCache.get(userId);
   if (cached && Date.now() - cached.time < 10 * 60 * 1000) return cached.url;
@@ -143,56 +138,78 @@ async function getAvatarUrl(userId) {
 }
 
 // ===== BUILD HITLIST EMBED =====
+// FIX: profileUrl is always included in every status branch.
+// FIX: joinable check uses gameId AND gameInstanceId — if either is missing, joins are off.
+// FIX: Join URL uses the correct deep link format that opens the specific server instance.
 async function buildHitlistEmbed(user, displayName, presence) {
   const status     = presenceToStatus(presence);
   const profileUrl = `https://www.roblox.com/users/${user.userId}/profile`;
   const tsbUrl     = `https://www.roblox.com/games/${TSB_PLACE_ID}/The-Strongest-Battlegrounds`;
   const avatarUrl  = await getAvatarUrl(user.userId);
 
-  const inTSB    = presence && (presence.placeId === TSB_PLACE_ID || presence.rootPlaceId === TSB_PLACE_ID);
-  const joinable = inTSB && !!presence.gameId && !!presence.gameInstanceId;
+  // A user is in TSB when their rootPlaceId OR placeId matches
+  const inTSB = presence && (
+    presence.rootPlaceId === TSB_PLACE_ID ||
+    presence.placeId     === TSB_PLACE_ID
+  );
 
-  // ── Color & status bar ──
-  let color      = 0x2b2d31; // dark default (offline)
+  // Joinable = in TSB, AND both gameId and gameInstanceId are present and non-empty
+  const joinable = inTSB &&
+    presence.gameId           &&
+    presence.gameInstanceId   &&
+    presence.gameId           !== "" &&
+    presence.gameInstanceId   !== "";
+
+  let color      = 0x2b2d31;
   let statusLine = "⚫  **OFFLINE**";
   let tsbLine    = null;
+  let profileLine = `🔗 [**Profile**](${profileUrl})`;
 
-  if (status === "online" && !inTSB) {
-    color      = 0x5865f2; // blurple — online
+  if (status === "offline") {
+    color      = 0x2b2d31;
+    statusLine = "⚫  **OFFLINE**";
+  } else if (status === "online" && !inTSB) {
+    color      = 0x5865f2;
     statusLine = "🟢  **ONLINE** — browsing Roblox";
   } else if (status === "in_game" && !inTSB) {
-    color      = 0xffa500; // orange — in another game
-    statusLine = "🎮  **IN GAME** — not in TSB";
+    color      = 0xffa500;
+    statusLine = `🎮  **IN GAME** — not in TSB`;
+    if (presence?.lastLocation) {
+      statusLine += `\n📍 ${presence.lastLocation}`;
+    }
   } else if (inTSB && !joinable) {
-    color      = 0xe03c3c; // red — TSB, joins off
+    // In TSB but joins are OFF — still show profile + TSB link
+    color      = 0xe03c3c;
     statusLine = "🎮  **IN TSB** — joins **OFF**";
     tsbLine    = `🗡️ [Open TSB](${tsbUrl})`;
   } else if (inTSB && joinable) {
-    color      = 0xffd700; // gold — TSB, joinable
+    // Joins ON — deep link directly into their server instance
+    const joinUrl = `https://www.roblox.com/games/start?placeId=${TSB_PLACE_ID}&gameInstanceId=${presence.gameInstanceId}`;
+    color      = 0xffd700;
     statusLine = "🎯  **IN TSB — JOINS ON!**";
-    const joinUrl = `https://www.roblox.com/games/${TSB_PLACE_ID}?gameInstanceId=${presence.gameInstanceId}`;
     tsbLine    = `🚀 [**JOIN NOW**](${joinUrl})  ·  🗡️ [TSB](${tsbUrl})`;
   }
 
   const embed = new EmbedBuilder()
     .setColor(color)
-    .setTitle(`${displayName}`)
-    .setURL(profileUrl)
+    .setTitle(displayName)
+    .setURL(profileUrl)   // Clickable title → profile
     .addFields(
       {
-        name: "👤 Account",
-        value: `[**@${user.username}**](${profileUrl})`,
+        name:   "👤 Account",
+        value:  `[**@${user.username}**](${profileUrl})`,
         inline: true
       },
       {
-        name: "📶 Status",
-        value: statusLine,
+        name:   "📶 Status",
+        value:  statusLine,
         inline: true
       }
     )
     .setFooter({ text: `Roblox ID: ${user.userId}` })
     .setTimestamp();
 
+  // TSB field (only when in TSB)
   if (tsbLine) {
     embed.addFields({ name: "🎯 TSB", value: tsbLine, inline: false });
   }
@@ -206,9 +223,11 @@ async function buildHitlistEmbed(user, displayName, presence) {
 async function snipeUser(userId) {
   const presence = await getPresenceFull(userId);
   if (!presence || presence.userPresenceType === 0) return { status: "offline" };
-  const inTSB = presence.placeId === TSB_PLACE_ID || presence.rootPlaceId === TSB_PLACE_ID;
+
+  const inTSB = presence.rootPlaceId === TSB_PLACE_ID || presence.placeId === TSB_PLACE_ID;
+
   if (presence.userPresenceType === 2) {
-    if (!inTSB) return { status: "other_game" };
+    if (!inTSB) return { status: "other_game", location: presence.lastLocation };
     const joinable = !!presence.gameId && !!presence.gameInstanceId;
     if (joinable) return { status: "in_tsb_joinable", instanceId: presence.gameInstanceId };
     return { status: "in_tsb_nojoin" };
@@ -220,23 +239,34 @@ async function snipeUser(userId) {
 function buildSnipeEmbed(user, displayName, result) {
   const profileUrl = `https://www.roblox.com/users/${user.userId}/profile`;
   const tsbUrl     = `https://www.roblox.com/games/${TSB_PLACE_ID}/The-Strongest-Battlegrounds`;
-  let desc  = `👤 **${displayName}** (@${user.username})\n\n`;
+
+  let desc  = `👤 **${displayName}** ([@${user.username}](${profileUrl}))\n\n`;
   let color = 0x555555;
 
   if (result.status === "offline") {
     desc += "⚫ **Offline** — not in any game.";
   } else if (result.status === "online_not_ingame") {
-    desc += `🟢 **Online** — not in a game.\n🔗 [Profile](${profileUrl})`; color = 0x00aaff;
+    desc += `🟢 **Online** — not in a game.\n🔗 [Profile](${profileUrl})`;
+    color = 0x00aaff;
   } else if (result.status === "other_game") {
-    desc += `🎮 **In Game** — NOT in TSB.\n🔗 [Profile](${profileUrl})`; color = 0xffa500;
+    desc += `🎮 **In Game** — NOT in TSB.`;
+    if (result.location) desc += `\n📍 ${result.location}`;
+    desc += `\n🔗 [Profile](${profileUrl})`;
+    color = 0xffa500;
   } else if (result.status === "in_tsb_nojoin") {
-    desc += `🎮 **In TSB** — joins **OFF**.\n🔗 [Profile](${profileUrl})\n🗡️ [TSB](${tsbUrl})`; color = 0xff4444;
+    desc += `🎮 **In TSB** — joins **OFF**.\n🔗 [Profile](${profileUrl})\n🗡️ [TSB](${tsbUrl})`;
+    color = 0xff4444;
   } else if (result.status === "in_tsb_joinable") {
-    const joinUrl = `https://www.roblox.com/games/${TSB_PLACE_ID}?gameInstanceId=${result.instanceId}`;
-    desc += `🎯 **IN TSB — JOINS ON!**\n🚀 [Join Now](${joinUrl})\n🔗 [Profile](${profileUrl})\n🗡️ [TSB](${tsbUrl})`; color = 0xffff00;
+    const joinUrl = `https://www.roblox.com/games/start?placeId=${TSB_PLACE_ID}&gameInstanceId=${result.instanceId}`;
+    desc += `🎯 **IN TSB — JOINS ON!**\n🚀 [Join Now](${joinUrl})\n🔗 [Profile](${profileUrl})\n🗡️ [TSB](${tsbUrl})`;
+    color = 0xffff00;
   }
 
-  return new EmbedBuilder().setTitle("🔍 Snipe Result").setDescription(desc).setColor(color).setTimestamp();
+  return new EmbedBuilder()
+    .setTitle("🔍 Snipe Result")
+    .setDescription(desc)
+    .setColor(color)
+    .setTimestamp();
 }
 
 // ===== WEEKLY ANALYSIS EMBED =====
@@ -252,31 +282,22 @@ function buildAnalysisEmbed(db) {
     }
 
     const sessions = data.sessions;
-
-    // Average session length
-    const avgMs = sessions.reduce((a, s) => a + s.durationMs, 0) / sessions.length;
-    const avgMin = Math.round(avgMs / 60000);
-
-    // Total online time this week
+    const avgMs    = sessions.reduce((a, s) => a + s.durationMs, 0) / sessions.length;
+    const avgMin   = Math.round(avgMs / 60000);
     const totalMs  = sessions.reduce((a, s) => a + s.durationMs, 0);
     const totalHrs = (totalMs / 3600000).toFixed(1);
 
-    // Most active day
-    const bestDay = Object.entries(data.dailyCounts)
-      .sort(([,a],[,b]) => b - a)[0];
+    const bestDay     = Object.entries(data.dailyCounts).sort(([,a],[,b]) => b - a)[0];
     const bestDayName = bestDay ? DAY_NAMES[parseInt(bestDay[0])] : "N/A";
 
-    // Fatigue: average time before going offline from in_game
     const gameSessions = sessions.filter(s => s.status === "in_game");
     const avgGameMin   = gameSessions.length > 0
       ? Math.round(gameSessions.reduce((a,s) => a + s.durationMs, 0) / gameSessions.length / 60000)
       : 0;
 
-    // Target rating: shorter sessions + more offline = easier to catch
-    // Score 1-10 where 10 = easiest to target (short sessions, frequent offline)
-    const shortSession  = avgMin < 30 ? 3 : avgMin < 60 ? 2 : 0;
-    const lowTotal      = parseFloat(totalHrs) < 5 ? 3 : parseFloat(totalHrs) < 10 ? 1 : 0;
-    const targetScore   = Math.min(10, shortSession + lowTotal + (gameSessions.length > 0 ? 2 : 0));
+    const shortSession = avgMin < 30 ? 3 : avgMin < 60 ? 2 : 0;
+    const lowTotal     = parseFloat(totalHrs) < 5 ? 3 : parseFloat(totalHrs) < 10 ? 1 : 0;
+    const targetScore  = Math.min(10, shortSession + lowTotal + (gameSessions.length > 0 ? 2 : 0));
 
     lines.push(
       `**${user.username}**\n` +
@@ -299,16 +320,8 @@ function buildAnalysisEmbed(db) {
     .setTimestamp();
 }
 
-// ===== SMART TRACKER TICK =====
-// Rules:
-//   - Offline → stays untouched at top (no delete/repost, just in-place edit if embed changed)
-//   - offline → online  : delete old embed, repost at bottom (above in_game)
-//   - offline → in_game : delete old embed, repost at very bottom
-//   - online  → in_game : delete old embed, repost at very bottom
-//   - in_game → online  : delete old embed, repost above current in_game embeds
-//   - * → offline       : delete old embed, repost at top (after other offline)
-//   - same bucket       : in-place edit only, no reorder
-const lastKnownStatus = new Map(); // userId -> "offline"|"online"|"in_game"
+// ===== STATUS TRACKER =====
+const lastKnownStatus = new Map();
 
 async function runTrackerTick(client) {
   const channel = await client.channels.fetch(process.env.HITLIST_CHANNEL_ID).catch(() => null);
@@ -318,7 +331,6 @@ async function runTrackerTick(client) {
   const msgMap = loadMessageMap();
   if (!db.length) return;
 
-  // Fetch all presences in parallel
   const results = await Promise.all(
     db.map(async user => {
       const presence    = await getPresenceFull(user.userId);
@@ -328,21 +340,18 @@ async function runTrackerTick(client) {
     })
   );
 
-  // Record analytics for each user
   for (const { user, status } of results) {
     recordAnalytics(user.userId, status);
   }
 
-  // Split into changed vs unchanged
   const changed   = results.filter(r => lastKnownStatus.get(r.user.userId) !== r.status);
   const unchanged = results.filter(r => lastKnownStatus.get(r.user.userId) === r.status);
 
-  // Update lastKnownStatus for all
   for (const { user, status } of results) {
     lastKnownStatus.set(user.userId, status);
   }
 
-  // In-place edit for users whose status didn't change (no reorder needed)
+  // In-place edit for unchanged (no reorder)
   for (const { user, presence, displayName } of unchanged) {
     const msgId = msgMap[user.userId];
     if (!msgId) continue;
@@ -355,7 +364,6 @@ async function runTrackerTick(client) {
     return;
   }
 
-  // For changed users: delete old embed, then repost in correct bucket order
   // Delete old embeds for changed users
   for (const { user } of changed) {
     const existingId = msgMap[user.userId];
@@ -366,21 +374,17 @@ async function runTrackerTick(client) {
     }
   }
 
-  // Post changed users in bucket order: offline first, then online, then in_game
-  // This means: offline users reappear at "top" relative to the batch being reposted,
-  // but since in Discord messages go bottom = newest, posting offline first then
-  // online then in_game means in_game ends up at the very bottom (most recent).
+  // Repost in order: offline → online → in_game (in_game = newest = bottom)
   const offlineChanged = changed.filter(r => r.status === "offline");
   const onlineChanged  = changed.filter(r => r.status === "online");
   const ingameChanged  = changed.filter(r => r.status === "in_game");
 
-  // Post in order: offline → online → in_game (in_game newest = bottom of channel)
   for (const { user, presence, displayName } of [...offlineChanged, ...onlineChanged, ...ingameChanged]) {
     try {
       const embed = await buildHitlistEmbed(user, displayName, presence);
       const msg   = await channel.send({ embeds: [embed] });
       msgMap[user.userId] = msg.id;
-      await new Promise(r => setTimeout(r, 300)); // small delay between posts
+      await new Promise(r => setTimeout(r, 300));
     } catch (e) {
       console.log(`Error reposting embed for ${user.username}:`, e);
     }
@@ -390,25 +394,21 @@ async function runTrackerTick(client) {
 }
 
 // ===== WEEKLY REPORT SCHEDULER =====
-// Posts every Friday at 6 PM server local time
 function startWeeklyReport(client) {
   setInterval(async () => {
     const now = new Date();
-    // 5 = Friday, check at 18:00 (6 PM)
     if (now.getDay() !== 5) return;
     if (now.getHours() !== 18 || now.getMinutes() !== 0) return;
 
     const channelId = process.env.HITLIST_ANALYSIS_CHANNEL_ID;
     if (!channelId) return;
-
     const channel = await client.channels.fetch(channelId).catch(() => null);
     if (!channel) return;
 
-    const db = loadDB();
+    const db    = loadDB();
     const embed = buildAnalysisEmbed(db);
     await channel.send({ embeds: [embed] }).catch(() => {});
-
-  }, 60 * 1000); // check every minute
+  }, 60 * 1000);
 }
 
 // ===== COMMAND =====

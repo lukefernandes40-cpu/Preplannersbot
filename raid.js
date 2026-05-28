@@ -1,4 +1,14 @@
 // ===== RAID.JS =====
+// FIX 1: End-raid screenshot — any message with an image while awaitingScreenshot=true is
+//         captured immediately, regardless of whether the user also typed "upload".
+//         The upload/replace-ss commands are blocked while awaitingScreenshot is active.
+// FIX 2: Crystal-clear summary image — posted as a real file attachment so Discord
+//         never re-compresses it. setImage('attachment://raid-result.png') renders inline.
+// FIX 3: Opcode 8 GatewayRateLimitError — removed guild.members.fetch({withPresences:false})
+//         which triggers a full guild-wide chunk (opcode 8). We now fetch only the specific
+//         user IDs we need, and fall back to cache — never a full guild fetch.
+// FIX 4: DMs update INSTANTLY on every raid mutation (no 60s delay for DM updates).
+
 const {
   EmbedBuilder,
   ActionRowBuilder,
@@ -12,24 +22,46 @@ const {
   UserSelectMenuBuilder
 } = require("discord.js");
 
-const activeRaids = new Map();
+// Tracker is required lazily so circular deps are avoided at startup
+let _tracker = null;
+function getTracker() {
+  if (!_tracker) _tracker = require("./tracker");
+  return _tracker;
+}
 
-// ===== PARTICIPATION TRACKER =====
-// { userId: { count: number, misses: number } }
-const raidStats = new Map();
-
-// ===== PENDING END SESSIONS =====
-// { channelId: { raid, durationMs, selectedUsers: [] } }
-const pendingEnds = new Map();
-
-// ===== REFRESH PAUSED CHANNELS =====
-// Channels where the live panel refresh is suppressed (raid ending flow in progress)
+const activeRaids   = new Map();
+const raidStats     = new Map();
+const pendingEnds   = new Map();
 const refreshPaused = new Set();
 
-// ===== HELPER: HAS ROLE =====
+// ===== HELPER =====
 function hasRole(member, roleId) {
   if (!roleId) return false;
   return member?.roles?.cache?.has(roleId);
+}
+
+// ===== SAFE MEMBER FETCH =====
+// FIX 3: Never fetch the whole guild (opcode 8). Only fetch specific user IDs by passing
+// the user_ids array, which uses a targeted opcode 9 request — no rate limit issues.
+async function safeFetchMember(guild, userId) {
+  // Try cache first
+  const cached = guild.members.cache.get(userId);
+  if (cached) return cached;
+  // Fetch only this specific user — does NOT trigger opcode 8
+  try {
+    return await guild.members.fetch({ user: userId, force: false });
+  } catch {
+    return null;
+  }
+}
+
+// Fetch all members with a specific role without triggering opcode 8.
+// We use the cache (populated by the initial DM send) instead of a full guild chunk.
+async function fetchRoleMembers(guild, roleId) {
+  if (!roleId) return new Map();
+  // Members are already cached from when the raid DMs were sent.
+  // Filter from cache — no network request needed.
+  return guild.members.cache.filter(m => m.roles.cache.has(roleId) && !m.user.bot);
 }
 
 // ===== EMBED: MAIN RAID ALERT =====
@@ -50,7 +82,7 @@ function buildEmbed(raid) {
     .setTitle("⚔️ RAID ALERT")
     .setColor(0xff0000)
     .addFields(
-      { name: "🌍 Region",      value: raid.data.region },
+      { name: "🌍 Region",      value: raid.data.region  },
       { name: "🤝 Allies",      value: raid.data.allies  },
       { name: "⚔️ Enemies",     value: raid.data.enemies },
       { name: "🔗 Link",        value: raid.data.link    },
@@ -84,7 +116,9 @@ function buildStatusEmbed(raid) {
 }
 
 // ===== EMBED: RAID SUMMARY =====
-function buildSummaryEmbed(raid, durationMs, extraRaiders = [], screenshotUrl = null) {
+// FIX 2: The embed uses attachment://raid-result.png so the image is always full-res.
+// The actual file bytes are attached by the caller — not a remote URL in the embed.
+function buildSummaryEmbed(raid, durationMs, extraRaiders = [], hasScreenshot = false) {
   const ingame     = raid.members?.ingame || [];
   const queueUsers = Object.keys(raid.members?.queue || {});
   const allHelped  = [...new Set([...ingame, ...queueUsers, ...extraRaiders])];
@@ -117,8 +151,43 @@ function buildSummaryEmbed(raid, durationMs, extraRaiders = [], screenshotUrl = 
     )
     .setTimestamp();
 
-  if (screenshotUrl) embed.setImage(screenshotUrl);
+  // FIX 2: Use the attachment:// protocol — Discord renders this at full native resolution
+  // without any recompression. The actual PNG bytes are supplied via files:[].
+  if (hasScreenshot) {
+    embed.setImage("attachment://raid-result.png");
+  }
+
   return embed;
+}
+
+// ===== BUILD SUMMARY MESSAGE PAYLOAD =====
+// FIX 2: Returns { embeds, files } — if there's a screenshot URL we fetch the image
+// bytes and pass them as a real file attachment for full-res rendering.
+async function buildSummaryPayload(raid, durationMs, extraRaiders = [], screenshotUrl = null) {
+  const hasScreenshot = !!screenshotUrl;
+  const embed = buildSummaryEmbed(raid, durationMs, extraRaiders, hasScreenshot);
+
+  if (!hasScreenshot) {
+    return { embeds: [embed], files: [] };
+  }
+
+  // Fetch the image bytes from the Discord CDN URL and pass as attachment
+  try {
+    const fetch = require("node-fetch");
+    const res   = await fetch(screenshotUrl);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buffer = await res.buffer();
+    return {
+      embeds: [embed],
+      files:  [{ attachment: buffer, name: "raid-result.png" }]
+    };
+  } catch (e) {
+    // If fetch fails, fall back to remote URL (still shows, just may compress)
+    console.log("⚠️ Could not fetch screenshot bytes, falling back to URL:", e.message);
+    const fallbackEmbed = buildSummaryEmbed(raid, durationMs, extraRaiders, false);
+    fallbackEmbed.setImage(screenshotUrl);
+    return { embeds: [fallbackEmbed], files: [] };
+  }
 }
 
 // ===== BUTTONS: CONTROL =====
@@ -183,19 +252,15 @@ function getRaiderSelectRow() {
 }
 
 // ===== DM ALL RAIDERS =====
+// isUpdate=true  → edit existing DM messages in-place (instant, no new message)
+// isUpdate=false → send fresh DMs to every raid-role member
+// FIX 3: Uses fetchRoleMembers() which reads from cache — no opcode 8 chunk.
 async function dmAllRaiders(guild, raid, isUpdate = false) {
   const roleId = process.env.RAID_ROLE_ID;
   if (!roleId) return;
 
-  let members;
-  try {
-    // Fetch only members with the raid role — avoids the opcode 8 rate limit
-    // caused by fetching all guild members at once
-    members = await guild.members.fetch({ withPresences: false });
-    members = members.filter(m => m.roles.cache.has(roleId) && !m.user.bot);
-  } catch {
-    return;
-  }
+  // FIX 3: Read from cache — members are already there from guild startup / previous fetches.
+  const members = await fetchRoleMembers(guild, roleId);
 
   if (!raid.dmMessages) raid.dmMessages = {};
 
@@ -221,43 +286,39 @@ async function dmAllRaiders(guild, raid, isUpdate = false) {
         }
       }
     } catch {
-      // DMs closed — skip
+      // DMs closed — skip silently
     }
   }
 }
 
-// ===== FINALISE RAID (roles + DMs + summary channel) =====
-// Called AFTER the interaction has already been responded to
+// ===== FINALISE RAID =====
+// FIX 3: No guild.members.fetch() call here anymore — only targeted per-user fetches.
+// FIX 2: Uses buildSummaryPayload() which sends screenshot as a real file attachment.
 async function finaliseRaid(guild, client, raid, durationMs, extraRaiders = [], screenshotUrl = null) {
   const ingame     = raid.members?.ingame || [];
   const queueUsers = Object.keys(raid.members?.queue || {});
   const allHelped  = [...new Set([...ingame, ...queueUsers, ...extraRaiders])];
 
-  const summaryEmbed = buildSummaryEmbed(raid, durationMs, extraRaiders, screenshotUrl);
-
-  // Fetch members — safe to do now because interaction is already responded to
-  // withPresences: false avoids the GatewayRateLimitError on opcode 8
-  await guild.members.fetch({ withPresences: false });
+  // Build the summary payload (fetches screenshot bytes for full-res if needed)
+  const summaryPayload = await buildSummaryPayload(raid, durationMs, extraRaiders, screenshotUrl);
 
   // ===== ROLE ASSIGNMENT =====
+  // FIX 3: safeFetchMember per-user instead of fetching the whole guild
   for (const userId of allHelped) {
     const stats  = raidStats.get(userId) || { count: 0, misses: 0 };
     stats.count += 1;
     stats.misses = 0;
     raidStats.set(userId, stats);
 
-    const member = guild.members.cache.get(userId);
+    const member = await safeFetchMember(guild, userId);
     if (!member) continue;
 
-    // Remove No Help role
     if (process.env.NO_HELP_ROLE_ID && hasRole(member, process.env.NO_HELP_ROLE_ID)) {
       await member.roles.remove(process.env.NO_HELP_ROLE_ID).catch(() => {});
     }
-    // Role Helper — after 1st participation
     if (process.env.ROLE_HELPER_ROLE_ID && stats.count === 1) {
       await member.roles.add(process.env.ROLE_HELPER_ROLE_ID).catch(() => {});
     }
-    // Active Raider — after 5th participation
     if (process.env.ACTIVE_RAIDER_ROLE_ID && stats.count >= 5) {
       await member.roles.add(process.env.ACTIVE_RAIDER_ROLE_ID).catch(() => {});
     }
@@ -265,6 +326,7 @@ async function finaliseRaid(guild, client, raid, durationMs, extraRaiders = [], 
 
   // No Help — 5 consecutive misses
   if (process.env.NO_HELP_ROLE_ID) {
+    // FIX 3: Use cache — no full guild fetch
     const raidRoleMembers = guild.members.cache.filter(
       m => m.roles.cache.has(process.env.RAID_ROLE_ID) && !m.user.bot
     );
@@ -279,21 +341,29 @@ async function finaliseRaid(guild, client, raid, durationMs, extraRaiders = [], 
     }
   }
 
-  // Post to summary channel
+  // Post to summary channel — FIX 2: full-res file attachment
   if (process.env.RAID_SUMMARY_CHANNEL_ID) {
     try {
       const sumCh = await client.channels.fetch(process.env.RAID_SUMMARY_CHANNEL_ID);
-      if (sumCh) await sumCh.send({ embeds: [summaryEmbed] });
-    } catch {}
+      if (sumCh) await sumCh.send(summaryPayload);
+    } catch (e) {
+      console.log("Error posting to summary channel:", e.message);
+    }
   }
 
-  // DM summary to all raiders
+  // DM summary to all raid-role members — FIX 2 + FIX 3
   const roleId = process.env.RAID_ROLE_ID;
   if (roleId) {
     const members = guild.members.cache.filter(m => m.roles.cache.has(roleId) && !m.user.bot);
     for (const [, member] of members) {
-      await member.user.send({ embeds: [summaryEmbed] }).catch(() => {});
+      // FIX 2: Send the same full-res payload to each DM
+      await member.user.send(summaryPayload).catch(() => {});
     }
+  }
+
+  // Post anti-leak tracker report for this raid to the admin channel
+  if (raid.raidId) {
+    getTracker().postRaidReport(raid.raidId).catch(() => {});
   }
 }
 
@@ -318,13 +388,11 @@ async function createRaid(interaction) {
     )
   );
 
-  // showModal is the FIRST and ONLY response — no awaits before it
   return interaction.showModal(modal);
 }
 
 // ===== HANDLE RAID MODAL =====
 async function handleRaidModal(interaction) {
-  // Defer immediately — buys us 15 minutes for slow work
   await interaction.deferReply({ flags: 64 });
 
   const guild = interaction.guild;
@@ -363,7 +431,8 @@ async function handleRaidModal(interaction) {
     messageId: null,
     statusMessageId: null,
     memberActionMessageId: null,
-    dmMessages: {}
+    dmMessages: {},
+    raidId: `RAID-${channel.id}`   // stored so finaliseRaid can post the tracker report
   };
 
   const msg = await channel.send({ embeds: [buildEmbed(raidState)], components: getControlRows() });
@@ -377,16 +446,22 @@ async function handleRaidModal(interaction) {
 
   activeRaids.set(channel.id, raidState);
 
-  // editReply first so Discord sees we handled it
   await interaction.editReply({ content: `✅ Raid created: <#${channel.id}>` });
 
-  // DMs can now take as long as they need
+  // DMs sent immediately — cache is populated from guild startup
   dmAllRaiders(guild, raidState, false).catch(console.error);
+
+  // Generate personal tracking tokens and DM them to every raid-role member.
+  // Pass data.link so each token redirects silently to the actual public server link.
+  const raidId  = `RAID-${channel.id}`;
+  const tracker = getTracker();
+  tracker.createRaidTokens(guild, raidId, data.link).then(tokenMap => {
+    tracker.dmRaidTokens(guild, raidId, raidState, tokenMap).catch(console.error);
+  }).catch(console.error);
 }
 
 // ===== HANDLE EDIT MODAL =====
 async function handleEditModal(interaction) {
-  // Defer immediately
   await interaction.deferReply({ flags: 64 });
 
   const channelId = interaction.customId.replace("edit_raid_", "");
@@ -398,7 +473,6 @@ async function handleEditModal(interaction) {
   raid.data.enemies = interaction.fields.getTextInputValue("enemies");
   raid.data.link    = interaction.fields.getTextInputValue("link");
 
-  // Update channel embed
   const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
   if (channel && raid.messageId) {
     const msg = await channel.messages.fetch(raid.messageId).catch(() => null);
@@ -407,7 +481,7 @@ async function handleEditModal(interaction) {
 
   await interaction.editReply({ content: "✅ Raid updated." });
 
-  // Sync DMs after replying
+  // DMs updated INSTANTLY
   dmAllRaiders(interaction.guild, raid, true).catch(console.error);
 }
 
@@ -433,15 +507,13 @@ async function handleQueueModal(interaction) {
     raid.members.queue[userId] = num;
   }
 
-  // Acknowledge immediately
   await interaction.deferUpdate().catch(() => {});
 
-  // Slow work after
   await updateStatusEmbed(interaction.client, channelId, raid);
   dmAllRaiders(interaction.guild, raid, true).catch(console.error);
 }
 
-// ===== UPDATE STATUS EMBED =====
+// ===== UPDATE STATUS EMBED IN CHANNEL =====
 async function updateStatusEmbed(client, channelId, raid) {
   const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel || !raid.statusMessageId) return;
@@ -450,6 +522,9 @@ async function updateStatusEmbed(client, channelId, raid) {
 }
 
 // ===== HANDLE SCREENSHOT MESSAGE =====
+// FIX 1: When awaitingScreenshot=true, ANY message with an image (regardless of text)
+//         is captured for the raid-end summary — even if the user typed "upload".
+//         The upload/replace-ss commands are fully blocked in this state.
 async function handleMessage(message) {
   if (message.author.bot) return;
 
@@ -457,16 +532,27 @@ async function handleMessage(message) {
   const raid = activeRaids.get(channelId);
   if (!raid) return;
 
-  // ===== AWAITING RAID END SCREENSHOT =====
+  // ===== AWAITING RAID END SCREENSHOT — checked FIRST, blocks everything else =====
   const pending = pendingEnds.get(channelId);
   if (pending?.awaitingScreenshot) {
-    const img = message.attachments.find(a => a.contentType?.startsWith("image/"));
+    // Look for an image in this message (direct attach OR reply-to attach)
+    let img = message.attachments.find(a => a.contentType?.startsWith("image/")) || null;
+
+    if (!img && message.reference?.messageId) {
+      try {
+        const refMsg = await message.channel.messages.fetch(message.reference.messageId);
+        img = refMsg.attachments.find(a => a.contentType?.startsWith("image/")) || null;
+      } catch {}
+    }
+
     if (img) {
+      // Grab the URL — we'll re-fetch as bytes in buildSummaryPayload for full-res
       pending.awaitingScreenshot = false;
       pending.screenshotUrl = img.url;
 
       await message.reply("✅ Screenshot captured! Sending raid summary now...");
 
+      // Snapshot before deleting from maps
       const { raid: pendingRaid, durationMs, selectedUsers, screenshotUrl } = pending;
       pendingEnds.delete(channelId);
       activeRaids.delete(channelId);
@@ -476,10 +562,19 @@ async function handleMessage(message) {
       setTimeout(() => message.channel.delete().catch(() => {}), 4000);
       return;
     }
-    // If they sent a non-image message while awaiting, ignore (let normal flow continue)
+
+    // No image in this message — if it was a text-only message, give a hint
+    if (message.content.trim()) {
+      await message.reply(
+        "📸 Still waiting for your **raid screenshot**.\n" +
+        "Attach an image to your message (with or without text) and send it, or click **✅ Confirm & Send Summary** to skip."
+      ).catch(() => {});
+    }
+    // Either way, stop here — don't fall through to upload/replace-ss logic
     return;
   }
 
+  // ===== NORMAL IN-RAID SCREENSHOT COMMANDS (upload / replace ss 1 / replace ss 2) =====
   const cmd = message.content.trim().toLowerCase();
 
   const isUpload   = cmd === "upload";
@@ -488,20 +583,17 @@ async function handleMessage(message) {
 
   if (!isUpload && !isReplace1 && !isReplace2) return;
 
-  // Look for image on this message first
+  // Find image
   let imageUrl = null;
   const directImg = message.attachments.find(a => a.contentType?.startsWith("image/"));
   if (directImg) imageUrl = directImg.url;
 
-  // Then check replied-to message
   if (!imageUrl && message.reference?.messageId) {
     try {
       const refMsg = await message.channel.messages.fetch(message.reference.messageId);
       const refImg = refMsg.attachments.find(a => a.contentType?.startsWith("image/"));
       if (refImg) imageUrl = refImg.url;
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
   if (!imageUrl) {
@@ -533,13 +625,14 @@ async function handleMessage(message) {
     await message.reply("🔄 **Screenshot 2** replaced!");
   }
 
-  // Update embed
+  // Update channel embed
   const channel = await message.client.channels.fetch(channelId).catch(() => null);
   if (channel && raid.messageId) {
     const msg = await channel.messages.fetch(raid.messageId).catch(() => null);
     if (msg) await msg.edit({ embeds: [buildEmbed(raid)], components: getControlRows() });
   }
 
+  // DMs updated INSTANTLY on screenshot
   dmAllRaiders(message.guild, raid, true).catch(console.error);
 }
 
@@ -549,27 +642,22 @@ async function handleMessage(message) {
 async function handleButton(interaction, client) {
   const customId = interaction.customId;
 
-  // ── Raider select menu value stored ──
-  if (customId === "raid_raider_select") {
-    // This is handled by handleSelectMenu, not here
-    return false;
-  }
+  if (customId === "raid_raider_select") return false;
 
   // ── Screenshot upload step ──
   if (customId === "raid_screenshot_end") {
     const pending = pendingEnds.get(interaction.channel.id);
-    if (!pending) {
-      return interaction.reply({ content: "❌ No pending raid end.", flags: 64 });
-    }
+    if (!pending) return interaction.reply({ content: "❌ No pending raid end.", flags: 64 });
 
     pending.awaitingScreenshot = true;
 
     await interaction.reply({
       content:
         "📸 **Upload your raid screenshot now.**\n" +
-        "Send an image in this channel and it will be attached to the summary embed.\n" +
-        "Once uploaded, the summary will be sent automatically.\n\n" +
-        "*(You can also click **✅ Confirm & Send Summary** at any time to send without a screenshot.)*",
+        "Attach an image to a message in this channel and send it.\n" +
+        "You can also type `upload` in the same message — either way works.\n\n" +
+        "The summary will be sent automatically once the image is received.\n\n" +
+        "*(Click **✅ Confirm & Send Summary** at any time to skip the screenshot.)*",
       flags: 64
     });
     return true;
@@ -578,11 +666,9 @@ async function handleButton(interaction, client) {
   // ── Confirm end ──
   if (customId === "raid_confirm_end") {
     const pending = pendingEnds.get(interaction.channel.id);
-    if (!pending) {
-      return interaction.reply({ content: "❌ No pending raid end.", flags: 64 });
-    }
+    if (!pending) return interaction.reply({ content: "❌ No pending raid end.", flags: 64 });
 
-    // Respond FIRST
+    // Respond FIRST — nothing async before this
     await interaction.update({ content: "⏳ Sending summary...", embeds: [], components: [] });
 
     const { raid, durationMs, screenshotUrl } = pending;
@@ -597,14 +683,11 @@ async function handleButton(interaction, client) {
     return true;
   }
 
-  // ── Skip end (kept for backward compat, no longer shown in UI) ──
+  // ── Skip end (backward compat) ──
   if (customId === "raid_skip_end") {
     const pending = pendingEnds.get(interaction.channel.id);
-    if (!pending) {
-      return interaction.reply({ content: "❌ No pending raid end.", flags: 64 });
-    }
+    if (!pending) return interaction.reply({ content: "❌ No pending raid end.", flags: 64 });
 
-    // Respond FIRST
     await interaction.update({ content: "⏳ Sending summary...", embeds: [], components: [] });
 
     const { raid, durationMs } = pending;
@@ -630,14 +713,11 @@ async function handleButton(interaction, client) {
       const rem = cooldown - (now - raid.lastPing);
       const m   = Math.floor(rem / 60000);
       const s   = Math.ceil((rem % 60000) / 1000);
-      // Reply first, nothing slow before it
       return interaction.reply({ content: `⏳ Wait ${m}m ${s}s before pinging again.`, flags: 64 });
     }
 
     raid.lastPing = now;
-    // Defer first
     await interaction.deferReply({ flags: 64 });
-    // Slow work after
     await interaction.channel.send({
       content: `🚨 RAID ALERT <@&${process.env.RAID_ROLE_ID}>`,
       allowedMentions: { roles: [process.env.RAID_ROLE_ID] }
@@ -652,7 +732,6 @@ async function handleButton(interaction, client) {
     const isHandler = hasRole(interaction.member, process.env.RAID_HANDLER_ROLE_ID);
 
     if (!isOwner && !isHandler) {
-      // Reply first — no async before this
       return interaction.reply({
         content: "❌ Only the raid owner or a Raid Handler can end this raid.",
         flags: 64
@@ -660,12 +739,17 @@ async function handleButton(interaction, client) {
     }
 
     const durationMs = Date.now() - raid.startTime;
-    pendingEnds.set(interaction.channel.id, { raid, durationMs, selectedUsers: [], screenshotUrl: null, awaitingScreenshot: false });
+    pendingEnds.set(interaction.channel.id, {
+      raid,
+      durationMs,
+      selectedUsers:    [],
+      screenshotUrl:    null,
+      awaitingScreenshot: false
+    });
 
-    // Pause the live refresh for this channel so it doesn't bury the end flow
     refreshPaused.add(interaction.channel.id);
 
-    // Reply FIRST — no async work before this
+    // Reply FIRST
     await interaction.reply({
       content:
         "## 🏁 Raid Ending\n" +
@@ -675,15 +759,14 @@ async function handleButton(interaction, client) {
       flags: 64
     });
 
-    // Freeze the channel panel in place: remove buttons so nobody can click during end flow
+    // Freeze the panel so nobody clicks during end flow
     try {
-      const channel = interaction.channel;
       if (raid.messageId) {
-        const panelMsg = await channel.messages.fetch(raid.messageId).catch(() => null);
+        const panelMsg = await interaction.channel.messages.fetch(raid.messageId).catch(() => null);
         if (panelMsg) await panelMsg.edit({ components: [] }).catch(() => {});
       }
       if (raid.memberActionMessageId) {
-        const memberMsg = await channel.messages.fetch(raid.memberActionMessageId).catch(() => null);
+        const memberMsg = await interaction.channel.messages.fetch(raid.memberActionMessageId).catch(() => null);
         if (memberMsg) await memberMsg.edit({ components: [] }).catch(() => {});
       }
     } catch {}
@@ -713,7 +796,7 @@ async function handleButton(interaction, client) {
       )
     );
 
-    // showModal MUST be the first and only response — no awaits before it
+    // showModal MUST be the first and only response
     await interaction.showModal(modal);
     return true;
   }
@@ -736,7 +819,7 @@ async function handleButton(interaction, client) {
       flags: 64
     });
 
-    // Slow work after
+    // Channel status + DMs instantly
     await updateStatusEmbed(client, interaction.channel.id, raid);
     dmAllRaiders(interaction.guild, raid, true).catch(console.error);
     return true;
@@ -781,7 +864,6 @@ async function handleSelectMenu(interaction) {
 
   pending.selectedUsers = interaction.values || [];
 
-  // Respond immediately
   await interaction.reply({
     content: `✅ **${pending.selectedUsers.length}** extra raider(s) selected. Click **Confirm & Send Summary** when ready.`,
     flags: 64
@@ -789,11 +871,13 @@ async function handleSelectMenu(interaction) {
   return true;
 }
 
-// ===== LIVE PANEL REFRESH (60s) =====
+// ===== LIVE CHANNEL PANEL REFRESH (60s) =====
+// This only refreshes the CHANNEL panel display — DMs are always updated
+// instantly through dmAllRaiders() calls after every mutation above.
+// FIX 3: No member fetches here — pure channel message operations only.
 function startRefresh(client) {
   setInterval(async () => {
     for (const [channelId, raid] of activeRaids.entries()) {
-      // Skip channels mid-end-flow — the panel is intentionally frozen
       if (refreshPaused.has(channelId)) continue;
 
       const channel = await client.channels.fetch(channelId).catch(() => null);
