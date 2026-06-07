@@ -1,1 +1,18 @@
-[]
+[
+  {
+    "username": "asd",
+    "password": "asd",
+    "owner": "597662856854372352",
+    "activeUserId": null,
+    "messageId": "1511106079113744444",
+    "channelId": "1496105194469982281"
+  },
+  {
+    "username": "what",
+    "password": "nigga",
+    "owner": "597662856854372352",
+    "activeUserId": null,
+    "messageId": "1511666231214866506",
+    "channelId": "1511659505082171502"
+  }
+]

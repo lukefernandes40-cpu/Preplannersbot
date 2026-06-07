@@ -1,13 +1,4 @@
 // ===== RAID.JS =====
-// FIX 1: End-raid screenshot — any message with an image while awaitingScreenshot=true is
-//         captured immediately, regardless of whether the user also typed "upload".
-//         The upload/replace-ss commands are blocked while awaitingScreenshot is active.
-// FIX 2: Crystal-clear summary image — posted as a real file attachment so Discord
-//         never re-compresses it. setImage('attachment://raid-result.png') renders inline.
-// FIX 3: Opcode 8 GatewayRateLimitError — removed guild.members.fetch({withPresences:false})
-//         which triggers a full guild-wide chunk (opcode 8). We now fetch only the specific
-//         user IDs we need, and fall back to cache — never a full guild fetch.
-// FIX 4: DMs update INSTANTLY on every raid mutation (no 60s delay for DM updates).
 
 const {
   EmbedBuilder,
@@ -19,185 +10,218 @@ const {
   TextInputStyle,
   PermissionsBitField,
   ChannelType,
-  UserSelectMenuBuilder
+  UserSelectMenuBuilder,
+  StringSelectMenuBuilder,
+  AttachmentBuilder
 } = require("discord.js");
 
-// Tracker is required lazily so circular deps are avoided at startup
-let _tracker = null;
-function getTracker() {
-  if (!_tracker) _tracker = require("./tracker");
-  return _tracker;
-}
+const fetch = require("node-fetch");
+const fs    = require("fs");
 
-const activeRaids   = new Map();
-const raidStats     = new Map();
-const pendingEnds   = new Map();
-const refreshPaused = new Set();
+// ===== STATE =====
+const activeRaids   = new Map();  // channelId -> raidState
+const raidStats     = new Map();  // userId -> { count, misses }
+const pendingEnds   = new Map();  // channelId -> pendingEnd
+const refreshPaused = new Set();  // channelIds where refresh is paused
 
-// ===== HELPER =====
+// ===== HELPERS =====
 function hasRole(member, roleId) {
   if (!roleId) return false;
   return member?.roles?.cache?.has(roleId);
 }
 
-// ===== SAFE MEMBER FETCH =====
-// FIX 3: Never fetch the whole guild (opcode 8). Only fetch specific user IDs by passing
-// the user_ids array, which uses a targeted opcode 9 request — no rate limit issues.
 async function safeFetchMember(guild, userId) {
-  // Try cache first
   const cached = guild.members.cache.get(userId);
   if (cached) return cached;
-  // Fetch only this specific user — does NOT trigger opcode 8
-  try {
-    return await guild.members.fetch({ user: userId, force: false });
-  } catch {
-    return null;
-  }
+  try { return await guild.members.fetch({ user: userId, force: false }); }
+  catch { return null; }
 }
 
-// Fetch all members with a specific role without triggering opcode 8.
-// We use the cache (populated by the initial DM send) instead of a full guild chunk.
 async function fetchRoleMembers(guild, roleId) {
   if (!roleId) return new Map();
-  // Members are already cached from when the raid DMs were sent.
-  // Filter from cache — no network request needed.
+  try { await guild.members.fetch(); } catch {}
   return guild.members.cache.filter(m => m.roles.cache.has(roleId) && !m.user.bot);
 }
 
-// ===== EMBED: MAIN RAID ALERT =====
-function buildEmbed(raid) {
-  const ss1 = raid.screenshots?.ss1;
-  const ss2 = raid.screenshots?.ss2;
-
-  let ssValue = "";
-  if (ss1 || ss2) {
-    if (ss1) ssValue += `[📸 SS 1](${ss1})`;
-    if (ss1 && ss2) ssValue += "  ·  ";
-    if (ss2) ssValue += `[📸 SS 2](${ss2})`;
-  } else {
-    ssValue = "Send an image with `upload` to add screenshots.";
+// Find raid by channel id or by owner/user id (for DM interactions)
+function findRaidForInteraction(interaction) {
+  if (interaction.channel?.id) {
+    const r = activeRaids.get(interaction.channel.id);
+    if (r) return r;
   }
+  for (const [, r] of activeRaids) {
+    if (r.owner === interaction.user.id) return r;
+    if (r.dmMessages && r.dmMessages[interaction.user.id]) return r;
+  }
+  return null;
+}
+
+function findRaidChannelId(raid) {
+  for (const [channelId, r] of activeRaids) {
+    if (r === raid) return channelId;
+  }
+  return null;
+}
+
+// ===== COLOURS =====
+const COLOURS = {
+  alert:   0xff2244,
+  status:  0xff8c00,
+  summary: 0x00e676,
+  info:    0x5865f2,
+  swap:    0x9c27b0,
+  note:    0xffd700
+};
+
+// ===== DIFFICULTY PRESETS =====
+const DIFFICULTY_PRESETS = [
+  "EZ Clap", "Mid", "Locked In", "Cooked", "Beyond Saving",
+  "Absolutely Fried", "Getting Real", "Its Aight", "Developer Difficulty",
+  "Nah Bro", "Pack It Up", "Start Praying", "Call The Ancestors",
+  "Streamer Lobby", "A Few Mfs", "Fries ✌"
+];
+
+// ===== EMBEDS =====
+function buildEmbed(raid) {
+  const diff = raid.data.difficulty ? `\`\`\`${raid.data.difficulty}\`\`\`` : "`Not Set`";
 
   return new EmbedBuilder()
-    .setTitle("⚔️ RAID ALERT")
-    .setColor(0xff0000)
-    .addFields(
-      { name: "🌍 Region",      value: raid.data.region  },
-      { name: "🤝 Allies",      value: raid.data.allies  },
-      { name: "⚔️ Enemies",     value: raid.data.enemies },
-      { name: "🔗 Link",        value: raid.data.link    },
-      { name: "📷 Screenshots", value: ssValue           }
+    .setTitle("⚔️  RAID ALERT")
+    .setColor(COLOURS.alert)
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+      "A raid has been called! Get in position and coordinate with your team.\n" +
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
+    .addFields(
+      { name: "🌍  Region",     value: `\`\`\`${raid.data.region}\`\`\``,    inline: true  },
+      { name: "🤝  Allies",     value: `\`\`\`${raid.data.allies}\`\`\``,    inline: true  },
+      { name: "⚔️  Enemies",    value: `\`\`\`${raid.data.enemies}\`\`\``,   inline: false },
+      { name: "💀  Difficulty", value: diff,                                  inline: true  }
+    )
+    .setFooter({ text: "React fast • Stay focused • Win the raid" })
     .setTimestamp();
 }
 
-// ===== EMBED: RAID STATUS =====
 function buildStatusEmbed(raid) {
-  const ingame = raid.members?.ingame || [];
-  const queue  = raid.members?.queue  || {};
+  const ingame     = raid.members?.ingame      || [];
+  const inposition = raid.members?.inposition  || [];
 
   const ingameList = ingame.length > 0
-    ? ingame.map(id => `<@${id}>`).join(", ")
-    : "None";
+    ? ingame.map(id => `> <@${id}>`).join("\n")
+    : "> *Nobody in game yet*";
 
-  const queueLines = Object.entries(queue)
-    .sort(([, a], [, b]) => a - b)
-    .map(([uid, pos]) => `<@${uid}>: **#${pos}**`)
-    .join("\n") || "None";
+  const inposList = inposition.length > 0
+    ? inposition.map(entry => `> \`#${entry.slot}\` <@${entry.userId}>`).join("\n")
+    : "> *Queue is empty*";
 
   return new EmbedBuilder()
-    .setTitle("📊 Raid Status")
-    .setColor(0xff6600)
+    .setTitle("📊  Live Raid Status")
+    .setColor(COLOURS.status)
+    .setDescription("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     .addFields(
-      { name: "🎮 In Game",        value: ingameList },
-      { name: "🔢 Queue Position", value: queueLines }
+      { name: "🎮  In Game",     value: ingameList, inline: false },
+      { name: "📍  In Position", value: inposList,  inline: false }
     )
+    .setFooter({ text: "Updates in real-time" })
     .setTimestamp();
 }
 
-// ===== EMBED: RAID SUMMARY =====
-// FIX 2: The embed uses attachment://raid-result.png so the image is always full-res.
-// The actual file bytes are attached by the caller — not a remote URL in the embed.
-function buildSummaryEmbed(raid, durationMs, extraRaiders = [], hasScreenshot = false) {
-  const ingame     = raid.members?.ingame || [];
-  const queueUsers = Object.keys(raid.members?.queue || {});
-  const allHelped  = [...new Set([...ingame, ...queueUsers, ...extraRaiders])];
+// ===== FIXED SUMMARY EMBED — players placed in correct category =====
+function buildSummaryEmbed(raid, durationMs, extraRaiders = []) {
+  // Use the state as it was when raid ended — ingame and inposition are separate
+  const ingame     = raid.members?.ingame      || [];
+  const inposition = raid.members?.inposition  || [];  // array of { userId, slot }
+
+  // Extra raiders added manually at end go into raider list only if not already tracked
+  const trackedIds = new Set([...ingame, ...inposition.map(e => e.userId)]);
+  const onlyExtra  = extraRaiders.filter(id => !trackedIds.has(id));
 
   const totalSec = Math.floor(durationMs / 1000);
-  const days = Math.floor(totalSec / 86400);
-  const hrs  = Math.floor((totalSec % 86400) / 3600);
+  const hrs  = Math.floor(totalSec / 3600);
   const mins = Math.floor((totalSec % 3600) / 60);
   const secs = totalSec % 60;
 
   let durStr = "";
-  if (days > 0) durStr += `${days}d `;
   if (hrs  > 0) durStr += `${hrs}h `;
   if (mins > 0) durStr += `${mins}m `;
   durStr += `${secs}s`;
 
-  const raiderList = allHelped.length > 0
-    ? allHelped.map(id => `<@${id}>`).join("\n")
-    : "No raiders recorded.";
+  const allHelped = [...ingame, ...inposition.map(e => e.userId), ...onlyExtra];
+  const uniqueAll = [...new Set(allHelped)];
 
-  const embed = new EmbedBuilder()
-    .setTitle("🏁 Raid Completed")
-    .setColor(0x00ff99)
-    .setDescription("The raid has concluded. Great work!")
-    .addFields(
-      { name: "⏱️ Duration",    value: durStr,                   inline: true },
-      { name: "👥 Raiders",     value: String(allHelped.length), inline: true },
-      { name: "\u200b",         value: "\u200b",                 inline: true },
-      { name: "⚔️ Raider List", value: raiderList }
+  // Raider list = ingame + extra (not inposition-only)
+  const raiderIds = [...new Set([...ingame, ...onlyExtra])];
+  const raiderList = raiderIds.length > 0
+    ? raiderIds.map(id => `> <@${id}>`).join("\n")
+    : "> No raiders recorded.";
+
+  // In Position list = only those who were in inposition (not ingame)
+  const inposOnly = inposition.filter(e => !ingame.includes(e.userId));
+  const inposList = inposOnly.length > 0
+    ? inposOnly.map(e => `> \`#${e.slot}\` <@${e.userId}>`).join("\n")
+    : "> None";
+
+  const diff = raid.data?.difficulty ? `\`${raid.data.difficulty}\`` : "`N/A`";
+
+  return new EmbedBuilder()
+    .setTitle("🏁  Raid Completed — GG!")
+    .setColor(COLOURS.summary)
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+      "The raid has concluded. Thank you to everyone who participated!\n" +
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
+    .addFields(
+      { name: "⏱️  Duration",     value: `\`${durStr}\``,             inline: true  },
+      { name: "👥  Total Raiders", value: `\`${uniqueAll.length}\``,  inline: true  },
+      { name: "💀  Difficulty",    value: diff,                        inline: true  },
+      { name: "🌍  Region",        value: `\`${raid.data?.region || "N/A"}\``, inline: true },
+      { name: "\u200b",            value: "\u200b",                    inline: true  },
+      { name: "\u200b",            value: "\u200b",                    inline: true  },
+      { name: "⚔️  Raider List",   value: raiderList,                  inline: false },
+      { name: "📍  In Position",   value: inposList,                   inline: false }
+    )
+    .setFooter({ text: "Well done to everyone who participated!" })
     .setTimestamp();
-
-  // FIX 2: Use the attachment:// protocol — Discord renders this at full native resolution
-  // without any recompression. The actual PNG bytes are supplied via files:[].
-  if (hasScreenshot) {
-    embed.setImage("attachment://raid-result.png");
-  }
-
-  return embed;
 }
 
-// ===== BUILD SUMMARY MESSAGE PAYLOAD =====
-// FIX 2: Returns { embeds, files } — if there's a screenshot URL we fetch the image
-// bytes and pass them as a real file attachment for full-res rendering.
+// ===== BUILD SUMMARY PAYLOAD =====
 async function buildSummaryPayload(raid, durationMs, extraRaiders = [], screenshotUrl = null) {
-  const hasScreenshot = !!screenshotUrl;
-  const embed = buildSummaryEmbed(raid, durationMs, extraRaiders, hasScreenshot);
+  const embed = buildSummaryEmbed(raid, durationMs, extraRaiders);
 
-  if (!hasScreenshot) {
-    return { embeds: [embed], files: [] };
-  }
+  if (!screenshotUrl) return { embeds: [embed], files: [] };
 
-  // Fetch the image bytes from the Discord CDN URL and pass as attachment
   try {
-    const fetch = require("node-fetch");
-    const res   = await fetch(screenshotUrl);
+    const res = await fetch(screenshotUrl);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const buffer = await res.buffer();
-    return {
-      embeds: [embed],
-      files:  [{ attachment: buffer, name: "raid-result.png" }]
-    };
+    const attachment = new AttachmentBuilder(buffer, { name: "raid-screenshot.png" });
+    embed.setImage("attachment://raid-screenshot.png");
+    return { embeds: [embed], files: [attachment] };
   } catch (e) {
-    // If fetch fails, fall back to remote URL (still shows, just may compress)
-    console.log("⚠️ Could not fetch screenshot bytes, falling back to URL:", e.message);
-    const fallbackEmbed = buildSummaryEmbed(raid, durationMs, extraRaiders, false);
-    fallbackEmbed.setImage(screenshotUrl);
-    return { embeds: [fallbackEmbed], files: [] };
+    console.log("⚠️ Could not fetch screenshot bytes:", e.message);
+    embed.setImage(screenshotUrl);
+    return { embeds: [embed], files: [] };
   }
 }
 
-// ===== BUTTONS: CONTROL =====
+// ===== BUTTON ROWS =====
 function getControlRows() {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId("raid_ping")
         .setLabel("🔔 Raid Ping")
-        .setStyle(ButtonStyle.Primary)
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("want_swap_account")
+        .setLabel("🔄 Want to Swap Acc?")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("raid_note")
+        .setLabel("📝 Note")
+        .setStyle(ButtonStyle.Secondary)
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -206,35 +230,69 @@ function getControlRows() {
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId("end_raid")
-        .setLabel("❌ End")
+        .setLabel("❌ End Raid")
         .setStyle(ButtonStyle.Danger)
     )
   ];
 }
 
-// ===== BUTTONS: MEMBER ACTIONS =====
+// ===== SINGLE DM ACTION ROW — all buttons in one message =====
+function getDMActionRow(link) {
+  const joinUrl = link && link.startsWith("http") ? link : "https://www.roblox.com";
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setLabel("🚀 Join Raid")
+        .setStyle(ButtonStyle.Link)
+        .setURL(joinUrl),
+      new ButtonBuilder()
+        .setCustomId("member_ingame")
+        .setLabel("🎮 I'm In Game")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId("member_inposition")
+        .setLabel("📍 In Position")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("want_swap_account")
+        .setLabel("🔄 Want to Swap Acc?")
+        .setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
+
 function getMemberActionRow() {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId("member_ingame")
-        .setLabel("🎮 In Game")
+        .setLabel("🎮 I'm In Game")
         .setStyle(ButtonStyle.Success),
       new ButtonBuilder()
-        .setCustomId("member_queue")
-        .setLabel("🔢 Set Queue Position")
+        .setCustomId("member_inposition")
+        .setLabel("📍 In Position")
         .setStyle(ButtonStyle.Primary)
     )
   ];
 }
 
-// ===== USER SELECT: RAIDER PICKER =====
+function getSwapActionRow() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("want_swap_account")
+        .setLabel("🔄 Want to Swap Acc?")
+        .setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
+
 function getRaiderSelectRow() {
   return [
     new ActionRowBuilder().addComponents(
       new UserSelectMenuBuilder()
         .setCustomId("raid_raider_select")
-        .setPlaceholder("Select extra raiders to add to the summary...")
+        .setPlaceholder("🔍 Search and select extra raiders...")
         .setMinValues(0)
         .setMaxValues(25)
     ),
@@ -245,65 +303,136 @@ function getRaiderSelectRow() {
         .setStyle(ButtonStyle.Success),
       new ButtonBuilder()
         .setCustomId("raid_screenshot_end")
-        .setLabel("📸 Raid Screenshot (optional)")
+        .setLabel("📸 Add Raid Screenshot (optional)")
         .setStyle(ButtonStyle.Secondary)
     )
   ];
 }
 
-// ===== DM ALL RAIDERS =====
-// isUpdate=true  → edit existing DM messages in-place (instant, no new message)
-// isUpdate=false → send fresh DMs to every raid-role member
-// FIX 3: Uses fetchRoleMembers() which reads from cache — no opcode 8 chunk.
+function getNoteTargetRow() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("note_send_ingame")
+        .setLabel("🎮 Send to In Game")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId("note_send_inposition")
+        .setLabel("📍 Send to In Position")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("note_send_both")
+        .setLabel("📨 Send to Both")
+        .setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
+
+function buildJoinRow(link) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setLabel("🚀 Join Raid")
+        .setStyle(ButtonStyle.Link)
+        .setURL(link && link.startsWith("http") ? link : "https://www.roblox.com")
+    )
+  ];
+}
+
+// ===== DIFFICULTY SELECT ROW =====
+function getDifficultySelectRow() {
+  const options = DIFFICULTY_PRESETS.map(p => ({ label: p, value: p }));
+  return [
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId("difficulty_preset_select")
+        .setPlaceholder("Select your difficulty in the following raid")
+        .addOptions(options)
+    )
+  ];
+}
+
+// ===== ROLE HELPERS =====
+async function assignMemberRole(guild, userId, roleId) {
+  if (!roleId) return;
+  const member = await safeFetchMember(guild, userId);
+  if (member) await member.roles.add(roleId).catch(() => {});
+}
+
+async function removeMemberRole(guild, userId, roleId) {
+  if (!roleId) return;
+  const member = await safeFetchMember(guild, userId);
+  if (member) await member.roles.remove(roleId).catch(() => {});
+}
+
+async function stripRaidRoles(guild, raid) {
+  const inGameRoleId     = process.env.IN_GAME_ROLE_ID;
+  const inPositionRoleId = process.env.IN_POSITION_ROLE_ID;
+  for (const userId of (raid.members?.ingame || [])) {
+    await removeMemberRole(guild, userId, inGameRoleId);
+  }
+  for (const entry of (raid.members?.inposition || [])) {
+    await removeMemberRole(guild, entry.userId, inPositionRoleId);
+  }
+}
+
+// ===== DM ALL RAIDERS — single combined message =====
 async function dmAllRaiders(guild, raid, isUpdate = false) {
   const roleId = process.env.RAID_ROLE_ID;
   if (!roleId) return;
 
-  // FIX 3: Read from cache — members are already there from guild startup / previous fetches.
   const members = await fetchRoleMembers(guild, roleId);
-
   if (!raid.dmMessages) raid.dmMessages = {};
 
   for (const [, member] of members) {
     try {
-      const existing = raid.dmMessages[member.id];
-
-      if (isUpdate && existing) {
+      if (isUpdate) {
+        const existing = raid.dmMessages[member.id];
+        if (!existing) continue;
         const dmChannel = await member.user.createDM().catch(() => null);
         if (!dmChannel) continue;
-        const alertMsg  = await dmChannel.messages.fetch(existing.alertMsgId).catch(() => null);
-        const statusMsg = await dmChannel.messages.fetch(existing.statusMsgId).catch(() => null);
-        if (alertMsg)  await alertMsg.edit({ embeds: [buildEmbed(raid)] }).catch(() => {});
-        if (statusMsg) await statusMsg.edit({ embeds: [buildStatusEmbed(raid)] }).catch(() => {});
-      } else if (!isUpdate) {
+
+        if (existing.alertMsgId) {
+          const alertMsg = await dmChannel.messages.fetch(existing.alertMsgId).catch(() => null);
+          if (alertMsg) await alertMsg.edit({ embeds: [buildEmbed(raid)] }).catch(() => {});
+        }
+        if (existing.statusMsgId) {
+          const statusMsg = await dmChannel.messages.fetch(existing.statusMsgId).catch(() => null);
+          if (statusMsg) await statusMsg.edit({ embeds: [buildStatusEmbed(raid)] }).catch(() => {});
+        }
+      } else {
+        // Fresh DM — alert embed
         const alertMsg  = await member.user.send({ embeds: [buildEmbed(raid)] }).catch(() => null);
+        // Status embed
         const statusMsg = await member.user.send({ embeds: [buildStatusEmbed(raid)] }).catch(() => null);
+
+        // All action buttons in ONE message: Join Raid | I'm In Game | In Position | Want to Swap Acc?
+        const actionMsg = await member.user.send({
+          content: "**Use the buttons below to manage your raid status:**",
+          components: getDMActionRow(raid.data.link)
+        }).catch(() => null);
+
         if (alertMsg && statusMsg) {
           raid.dmMessages[member.id] = {
             alertMsgId:  alertMsg.id,
-            statusMsgId: statusMsg.id
+            statusMsgId: statusMsg.id,
+            actionMsgId: actionMsg?.id || null
           };
         }
       }
-    } catch {
-      // DMs closed — skip silently
-    }
+    } catch { /* DMs closed */ }
   }
 }
 
 // ===== FINALISE RAID =====
-// FIX 3: No guild.members.fetch() call here anymore — only targeted per-user fetches.
-// FIX 2: Uses buildSummaryPayload() which sends screenshot as a real file attachment.
 async function finaliseRaid(guild, client, raid, durationMs, extraRaiders = [], screenshotUrl = null) {
-  const ingame     = raid.members?.ingame || [];
-  const queueUsers = Object.keys(raid.members?.queue || {});
-  const allHelped  = [...new Set([...ingame, ...queueUsers, ...extraRaiders])];
+  const ingame    = raid.members?.ingame      || [];
+  const inpos     = (raid.members?.inposition || []).map(e => e.userId);
+  const allHelped = [...new Set([...ingame, ...inpos, ...extraRaiders])];
 
-  // Build the summary payload (fetches screenshot bytes for full-res if needed)
   const summaryPayload = await buildSummaryPayload(raid, durationMs, extraRaiders, screenshotUrl);
 
-  // ===== ROLE ASSIGNMENT =====
-  // FIX 3: safeFetchMember per-user instead of fetching the whole guild
+  // ── Role awards ──
   for (const userId of allHelped) {
     const stats  = raidStats.get(userId) || { count: 0, misses: 0 };
     stats.count += 1;
@@ -324,9 +453,8 @@ async function finaliseRaid(guild, client, raid, durationMs, extraRaiders = [], 
     }
   }
 
-  // No Help — 5 consecutive misses
-  if (process.env.NO_HELP_ROLE_ID) {
-    // FIX 3: Use cache — no full guild fetch
+  // ── No Help (5 consecutive misses) ──
+  if (process.env.NO_HELP_ROLE_ID && process.env.RAID_ROLE_ID) {
     const raidRoleMembers = guild.members.cache.filter(
       m => m.roles.cache.has(process.env.RAID_ROLE_ID) && !m.user.bot
     );
@@ -341,7 +469,10 @@ async function finaliseRaid(guild, client, raid, durationMs, extraRaiders = [], 
     }
   }
 
-  // Post to summary channel — FIX 2: full-res file attachment
+  // ── Strip In Game / In Position roles ──
+  await stripRaidRoles(guild, raid);
+
+  // ── Post to summary channel ──
   if (process.env.RAID_SUMMARY_CHANNEL_ID) {
     try {
       const sumCh = await client.channels.fetch(process.env.RAID_SUMMARY_CHANNEL_ID);
@@ -351,20 +482,23 @@ async function finaliseRaid(guild, client, raid, durationMs, extraRaiders = [], 
     }
   }
 
-  // DM summary to all raid-role members — FIX 2 + FIX 3
-  const roleId = process.env.RAID_ROLE_ID;
-  if (roleId) {
-    const members = guild.members.cache.filter(m => m.roles.cache.has(roleId) && !m.user.bot);
+  // ── DM summary to all raid-role members ──
+  if (process.env.RAID_ROLE_ID) {
+    const members = guild.members.cache.filter(
+      m => m.roles.cache.has(process.env.RAID_ROLE_ID) && !m.user.bot
+    );
     for (const [, member] of members) {
-      // FIX 2: Send the same full-res payload to each DM
       await member.user.send(summaryPayload).catch(() => {});
     }
   }
+}
 
-  // Post anti-leak tracker report for this raid to the admin channel
-  if (raid.raidId) {
-    getTracker().postRaidReport(raid.raidId).catch(() => {});
-  }
+// ===== UPDATE STATUS EMBED =====
+async function updateStatusEmbed(client, channelId, raid) {
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel || !raid.statusMessageId) return;
+  const msg = await channel.messages.fetch(raid.statusMessageId).catch(() => null);
+  if (msg) await msg.edit({ embeds: [buildStatusEmbed(raid)] }).catch(() => {});
 }
 
 // ===== CREATE RAID =====
@@ -373,22 +507,62 @@ async function createRaid(interaction) {
     return interaction.reply({ content: "🚫 You are blacklisted from using `/raid`.", flags: 64 });
   }
 
-  const modal = new ModalBuilder()
-    .setCustomId("raid_modal")
-    .setTitle("⚔️ Raid Setup");
-
-  modal.addComponents(
-    ...["region", "allies", "enemies", "link"].map(f =>
+  await interaction.reply({
+    content:
+      "## ⚔️ Raid Setup — Step 1\nPick a **difficulty preset** from the dropdown, or click on continue to skip.",
+    components: [
+      ...getDifficultySelectRow(),
       new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId(f)
-          .setLabel(f.toUpperCase())
-          .setStyle(TextInputStyle.Short)
+        new ButtonBuilder()
+          .setCustomId("raid_open_modal")
+          .setLabel("▶️ Continue to Raid Form")
+          .setStyle(ButtonStyle.Primary)
       )
-    )
-  );
+    ],
+    flags: 64
+  });
+}
 
-  return interaction.showModal(modal);
+// ===== HANDLE SELECT MENU =====
+async function handleSelectMenu(interaction) {
+  if (interaction.customId === "difficulty_preset_select") {
+    const chosen = interaction.values[0];
+    if (!interaction.client._pendingDifficulty) interaction.client._pendingDifficulty = new Map();
+    interaction.client._pendingDifficulty.set(interaction.user.id, chosen);
+
+    await interaction.update({
+      content:
+        `## ⚔️ Raid Setup — Step 1\n✅ Difficulty set to **${chosen}**.\nNow click **▶️ Continue to Raid Form** to fill in the rest.`,
+      components: [
+        ...getDifficultySelectRow(),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId("raid_open_modal")
+            .setLabel("▶️ Continue to Raid Form")
+            .setStyle(ButtonStyle.Primary)
+        )
+      ]
+    });
+    return true;
+  }
+
+  if (interaction.customId === "raid_raider_select") {
+    const pending = pendingEnds.get(interaction.channel?.id);
+    if (!pending) {
+      await interaction.reply({ content: "❌ No pending raid end found.", flags: 64 });
+      return true;
+    }
+
+    pending.selectedUsers = interaction.values || [];
+
+    await interaction.reply({
+      content: `✅ **${pending.selectedUsers.length}** extra raider(s) selected. Click **Confirm & Send Summary** when ready.`,
+      flags: 64
+    });
+    return true;
+  }
+
+  return false;
 }
 
 // ===== HANDLE RAID MODAL =====
@@ -407,57 +581,55 @@ async function handleRaidModal(interaction) {
         id: interaction.user.id,
         allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages]
       },
-      {
+      ...(process.env.RAID_ROLE_ID ? [{
         id: process.env.RAID_ROLE_ID,
         allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages]
-      }
+      }] : [])
     ]
   });
 
+  const pendingDiff = interaction.client._pendingDifficulty?.get(interaction.user.id) || null;
+  if (interaction.client._pendingDifficulty) interaction.client._pendingDifficulty.delete(interaction.user.id);
+
+  const typedDiff = interaction.fields.getTextInputValue("difficulty") || null;
+  const finalDiff = typedDiff || pendingDiff || null;
+
   const data = {
-    region:  interaction.fields.getTextInputValue("region"),
-    allies:  interaction.fields.getTextInputValue("allies"),
-    enemies: interaction.fields.getTextInputValue("enemies"),
-    link:    interaction.fields.getTextInputValue("link")
+    region:     interaction.fields.getTextInputValue("region"),
+    allies:     interaction.fields.getTextInputValue("allies"),
+    enemies:    interaction.fields.getTextInputValue("enemies"),
+    link:       interaction.fields.getTextInputValue("link"),
+    difficulty: finalDiff
   };
 
   const raidState = {
-    owner: interaction.user.id,
+    owner:                 interaction.user.id,
     data,
-    screenshots: { ss1: null, ss2: null },
-    lastPing: 0,
-    members: { ingame: [], queue: {} },
-    startTime: Date.now(),
-    messageId: null,
-    statusMessageId: null,
+    lastPing:              0,
+    members:               { ingame: [], inposition: [] },
+    startTime:             Date.now(),
+    messageId:             null,
+    statusMessageId:       null,
     memberActionMessageId: null,
-    dmMessages: {},
-    raidId: `RAID-${channel.id}`   // stored so finaliseRaid can post the tracker report
+    dmMessages:            {},
+    pendingNote:           null
   };
 
-  const msg = await channel.send({ embeds: [buildEmbed(raidState)], components: getControlRows() });
+  const msg       = await channel.send({ embeds: [buildEmbed(raidState)], components: getControlRows() });
   raidState.messageId = msg.id;
 
   const statusMsg = await channel.send({ embeds: [buildStatusEmbed(raidState)] });
   raidState.statusMessageId = statusMsg.id;
 
-  const memberMsg = await channel.send({ components: getMemberActionRow() });
+  const joinRow   = buildJoinRow(data.link);
+  const memberMsg = await channel.send({ components: [...joinRow, ...getMemberActionRow()] });
   raidState.memberActionMessageId = memberMsg.id;
 
   activeRaids.set(channel.id, raidState);
 
   await interaction.editReply({ content: `✅ Raid created: <#${channel.id}>` });
 
-  // DMs sent immediately — cache is populated from guild startup
   dmAllRaiders(guild, raidState, false).catch(console.error);
-
-  // Generate personal tracking tokens and DM them to every raid-role member.
-  // Pass data.link so each token redirects silently to the actual public server link.
-  const raidId  = `RAID-${channel.id}`;
-  const tracker = getTracker();
-  tracker.createRaidTokens(guild, raidId, data.link).then(tokenMap => {
-    tracker.dmRaidTokens(guild, raidId, raidState, tokenMap).catch(console.error);
-  }).catch(console.error);
 }
 
 // ===== HANDLE EDIT MODAL =====
@@ -468,10 +640,11 @@ async function handleEditModal(interaction) {
   const raid = activeRaids.get(channelId);
   if (!raid) return interaction.editReply({ content: "❌ Raid not found" });
 
-  raid.data.region  = interaction.fields.getTextInputValue("region");
-  raid.data.allies  = interaction.fields.getTextInputValue("allies");
-  raid.data.enemies = interaction.fields.getTextInputValue("enemies");
-  raid.data.link    = interaction.fields.getTextInputValue("link");
+  raid.data.region     = interaction.fields.getTextInputValue("region");
+  raid.data.allies     = interaction.fields.getTextInputValue("allies");
+  raid.data.enemies    = interaction.fields.getTextInputValue("enemies");
+  raid.data.link       = interaction.fields.getTextInputValue("link");
+  raid.data.difficulty = interaction.fields.getTextInputValue("difficulty") || raid.data.difficulty;
 
   const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
   if (channel && raid.messageId) {
@@ -480,173 +653,197 @@ async function handleEditModal(interaction) {
   }
 
   await interaction.editReply({ content: "✅ Raid updated." });
-
-  // DMs updated INSTANTLY
   dmAllRaiders(interaction.guild, raid, true).catch(console.error);
 }
 
-// ===== HANDLE QUEUE MODAL =====
-async function handleQueueModal(interaction) {
-  const channelId = interaction.customId.replace("queue_modal_", "");
+// ===== HANDLE NOTE MODAL =====
+async function handleNoteModal(interaction) {
+  const channelId = interaction.customId.replace("note_modal_", "");
   const raid = activeRaids.get(channelId);
-  if (!raid) return interaction.reply({ content: "❌ Raid not found", flags: 64 });
+  if (!raid) return interaction.reply({ content: "❌ Raid not found.", flags: 64 });
 
-  const raw = interaction.fields.getTextInputValue("queue_number").trim();
-  const num = parseInt(raw, 10);
-  if (isNaN(num) || num < 1 || num > 50) {
-    return interaction.reply({ content: "❌ Enter a number between **1** and **50**.", flags: 64 });
+  if (!hasRole(interaction.member, process.env.RAID_LEADER_ROLE_ID)) {
+    return interaction.reply({ content: "❌ Only Raid Leaders can send notes.", flags: 64 });
   }
 
-  const userId = interaction.user.id;
-  const igIdx  = raid.members.ingame.indexOf(userId);
-  if (igIdx !== -1) raid.members.ingame.splice(igIdx, 1);
+  const noteText = interaction.fields.getTextInputValue("note_text");
+  raid.pendingNote = { text: noteText, authorId: interaction.user.id };
 
-  if (raid.members.queue[userId] === num) {
-    delete raid.members.queue[userId];
+  return interaction.reply({
+    content: "📝 **Note ready!** Choose who to send this note to:",
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOURS.note)
+        .setTitle("📝 Note Preview")
+        .setDescription(noteText)
+        .setFooter({ text: "Select your audience below" })
+    ],
+    components: getNoteTargetRow(),
+    flags: 64
+  });
+}
+
+// ===== HANDLE IN POSITION MODAL =====
+async function handleInPositionModal(interaction) {
+  if (!interaction.customId.startsWith("inposition_modal_")) return false;
+
+  const raidChannelId = interaction.customId.replace("inposition_modal_", "");
+  let raid = activeRaids.get(raidChannelId);
+  if (!raid) return interaction.reply({ content: "❌ Raid not found.", flags: 64 });
+
+  const slotStr = interaction.fields.getTextInputValue("position_slot").trim();
+  const slot    = parseInt(slotStr, 10);
+
+  if (isNaN(slot) || slot < 1 || slot > 99) {
+    return interaction.reply({ content: "❌ Please enter a valid slot number (1–99).", flags: 64 });
+  }
+
+  const userId  = interaction.user.id;
+  const ingame  = raid.members.ingame;
+  const inpos   = raid.members.inposition;
+
+  // Remove from in-game if they were there
+  const igIdx = ingame.indexOf(userId);
+  if (igIdx !== -1) {
+    ingame.splice(igIdx, 1);
+    await removeMemberRole(interaction.guild || await interaction.client.guilds.fetch(process.env.GUILD_ID).catch(() => null), userId, process.env.IN_GAME_ROLE_ID);
+  }
+
+  const existingIdx = inpos.findIndex(e => e.userId === userId);
+  if (existingIdx !== -1) {
+    inpos[existingIdx].slot = slot;
+    await interaction.reply({ content: `✅ Updated your position to **#${slot}**!`, flags: 64 });
   } else {
-    raid.members.queue[userId] = num;
+    inpos.push({ userId, slot });
+    const guild = interaction.guild || await interaction.client.guilds.fetch(process.env.GUILD_ID).catch(() => null);
+    if (guild) await assignMemberRole(guild, userId, process.env.IN_POSITION_ROLE_ID);
+    await interaction.reply({ content: `✅ You're marked **In Position #${slot}**!`, flags: 64 });
   }
 
-  await interaction.deferUpdate().catch(() => {});
+  inpos.sort((a, b) => a.slot - b.slot);
 
-  await updateStatusEmbed(interaction.client, channelId, raid);
-  dmAllRaiders(interaction.guild, raid, true).catch(console.error);
+  const raidChannel = await interaction.client.channels.fetch(raidChannelId).catch(() => null);
+  if (raidChannel && raid.statusMessageId) {
+    const statusMsg = await raidChannel.messages.fetch(raid.statusMessageId).catch(() => null);
+    if (statusMsg) await statusMsg.edit({ embeds: [buildStatusEmbed(raid)] }).catch(() => {});
+  }
+
+  const guild = interaction.guild || await interaction.client.guilds.fetch(process.env.GUILD_ID).catch(() => null);
+  if (guild) dmAllRaiders(guild, raid, true).catch(console.error);
+
+  return true;
 }
 
-// ===== UPDATE STATUS EMBED IN CHANNEL =====
-async function updateStatusEmbed(client, channelId, raid) {
-  const channel = await client.channels.fetch(channelId).catch(() => null);
-  if (!channel || !raid.statusMessageId) return;
-  const msg = await channel.messages.fetch(raid.statusMessageId).catch(() => null);
-  if (msg) await msg.edit({ embeds: [buildStatusEmbed(raid)] });
-}
-
-// ===== HANDLE SCREENSHOT MESSAGE =====
-// FIX 1: When awaitingScreenshot=true, ANY message with an image (regardless of text)
-//         is captured for the raid-end summary — even if the user typed "upload".
-//         The upload/replace-ss commands are fully blocked in this state.
+// ===== HANDLE MESSAGE (screenshot detection) =====
 async function handleMessage(message) {
   if (message.author.bot) return;
+  if (!message.guild)     return;
 
   const channelId = message.channel.id;
+  const pending   = pendingEnds.get(channelId);
+  if (!pending?.awaitingScreenshot) return;
+
   const raid = activeRaids.get(channelId);
   if (!raid) return;
 
-  // ===== AWAITING RAID END SCREENSHOT — checked FIRST, blocks everything else =====
-  const pending = pendingEnds.get(channelId);
-  if (pending?.awaitingScreenshot) {
-    // Look for an image in this message (direct attach OR reply-to attach)
-    let img = message.attachments.find(a => a.contentType?.startsWith("image/")) || null;
+  const isOwner   = message.author.id === raid.owner;
+  const isHandler = message.member && hasRole(message.member, process.env.RAID_HANDLER_ROLE_ID);
+  if (!isOwner && !isHandler) return;
 
-    if (!img && message.reference?.messageId) {
-      try {
-        const refMsg = await message.channel.messages.fetch(message.reference.messageId);
-        img = refMsg.attachments.find(a => a.contentType?.startsWith("image/")) || null;
-      } catch {}
-    }
+  let img = message.attachments.find(a => a.contentType?.startsWith("image/")) || null;
 
-    if (img) {
-      // Grab the URL — we'll re-fetch as bytes in buildSummaryPayload for full-res
-      pending.awaitingScreenshot = false;
-      pending.screenshotUrl = img.url;
-
-      await message.reply("✅ Screenshot captured! Sending raid summary now...");
-
-      // Snapshot before deleting from maps
-      const { raid: pendingRaid, durationMs, selectedUsers, screenshotUrl } = pending;
-      pendingEnds.delete(channelId);
-      activeRaids.delete(channelId);
-      refreshPaused.delete(channelId);
-
-      await finaliseRaid(message.guild, message.client, pendingRaid, durationMs, selectedUsers || [], screenshotUrl);
-      setTimeout(() => message.channel.delete().catch(() => {}), 4000);
-      return;
-    }
-
-    // No image in this message — if it was a text-only message, give a hint
-    if (message.content.trim()) {
-      await message.reply(
-        "📸 Still waiting for your **raid screenshot**.\n" +
-        "Attach an image to your message (with or without text) and send it, or click **✅ Confirm & Send Summary** to skip."
-      ).catch(() => {});
-    }
-    // Either way, stop here — don't fall through to upload/replace-ss logic
-    return;
-  }
-
-  // ===== NORMAL IN-RAID SCREENSHOT COMMANDS (upload / replace ss 1 / replace ss 2) =====
-  const cmd = message.content.trim().toLowerCase();
-
-  const isUpload   = cmd === "upload";
-  const isReplace1 = cmd === "replace ss 1";
-  const isReplace2 = cmd === "replace ss 2";
-
-  if (!isUpload && !isReplace1 && !isReplace2) return;
-
-  // Find image
-  let imageUrl = null;
-  const directImg = message.attachments.find(a => a.contentType?.startsWith("image/"));
-  if (directImg) imageUrl = directImg.url;
-
-  if (!imageUrl && message.reference?.messageId) {
+  if (!img && message.reference?.messageId) {
     try {
       const refMsg = await message.channel.messages.fetch(message.reference.messageId);
-      const refImg = refMsg.attachments.find(a => a.contentType?.startsWith("image/"));
-      if (refImg) imageUrl = refImg.url;
+      img = refMsg.attachments.find(a => a.contentType?.startsWith("image/")) || null;
     } catch {}
   }
 
-  if (!imageUrl) {
-    await message.reply(
-      "❌ No image found.\n" +
-      "**How to upload:**\n" +
-      "• Attach an image to your message and type `upload`\n" +
-      "• **OR** reply to a message that has an image and type `upload`"
-    );
+  if (img) {
+    pending.awaitingScreenshot = false;
+    pending.screenshotUrl      = img.url;
+
+    await message.reply("✅ Screenshot captured! Sending raid summary now...");
+
+    const { raid: pendingRaid, durationMs, selectedUsers, screenshotUrl } = pending;
+    pendingEnds.delete(channelId);
+    activeRaids.delete(channelId);
+    refreshPaused.delete(channelId);
+
+    await finaliseRaid(message.guild, message.client, pendingRaid, durationMs, selectedUsers || [], screenshotUrl);
+    setTimeout(() => message.channel.delete().catch(() => {}), 4000);
     return;
   }
 
-  if (isUpload) {
-    if (!raid.screenshots.ss1) {
-      raid.screenshots.ss1 = imageUrl;
-      await message.reply("✅ **Screenshot 1** saved!");
-    } else if (!raid.screenshots.ss2) {
-      raid.screenshots.ss2 = imageUrl;
-      await message.reply("✅ **Screenshot 2** saved!");
-    } else {
-      await message.reply("⚠️ Both slots are full. Use `replace SS 1` or `replace SS 2`.");
-      return;
-    }
-  } else if (isReplace1) {
-    raid.screenshots.ss1 = imageUrl;
-    await message.reply("🔄 **Screenshot 1** replaced!");
-  } else if (isReplace2) {
-    raid.screenshots.ss2 = imageUrl;
-    await message.reply("🔄 **Screenshot 2** replaced!");
+  if (message.content.trim()) {
+    await message.reply(
+      "📸 Still waiting for your **raid screenshot**.\n" +
+      "Attach an image to your message and send it, or click **✅ Confirm & Send Summary** to skip."
+    ).catch(() => {});
   }
-
-  // Update channel embed
-  const channel = await message.client.channels.fetch(channelId).catch(() => null);
-  if (channel && raid.messageId) {
-    const msg = await channel.messages.fetch(raid.messageId).catch(() => null);
-    if (msg) await msg.edit({ embeds: [buildEmbed(raid)], components: getControlRows() });
-  }
-
-  // DMs updated INSTANTLY on screenshot
-  dmAllRaiders(message.guild, raid, true).catch(console.error);
 }
 
 // ===== HANDLE BUTTONS =====
-// CRITICAL RULE: every branch must call interaction.reply / deferReply / showModal / deferUpdate
-// as the VERY FIRST await. No async work before responding.
 async function handleButton(interaction, client) {
   const customId = interaction.customId;
 
+  // ── Open raid modal ──
+  if (customId === "raid_open_modal") {
+    const pendingDiff = interaction.client._pendingDifficulty?.get(interaction.user.id) || "";
+
+    const modal = new ModalBuilder()
+      .setCustomId("raid_modal")
+      .setTitle("⚔️ Raid Setup");
+
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("region")
+          .setLabel("REGION")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("allies")
+          .setLabel("ALLIES")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("enemies")
+          .setLabel("ENEMIES")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("link")
+          .setLabel("SERVER LINK")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("difficulty")
+          .setLabel("DIFFICULTY (personalize if needed)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setValue(pendingDiff)
+          .setPlaceholder("Or type: EZ Clap / Mid / Cooked / Start Praying...")
+      )
+    );
+
+    await interaction.showModal(modal);
+    return true;
+  }
+
   if (customId === "raid_raider_select") return false;
 
-  // ── Screenshot upload step ──
+  // ── Screenshot step ──
   if (customId === "raid_screenshot_end") {
-    const pending = pendingEnds.get(interaction.channel.id);
+    const pending = pendingEnds.get(interaction.channel?.id);
     if (!pending) return interaction.reply({ content: "❌ No pending raid end.", flags: 64 });
 
     pending.awaitingScreenshot = true;
@@ -654,9 +851,8 @@ async function handleButton(interaction, client) {
     await interaction.reply({
       content:
         "📸 **Upload your raid screenshot now.**\n" +
-        "Attach an image to a message in this channel and send it.\n" +
-        "You can also type `upload` in the same message — either way works.\n\n" +
-        "The summary will be sent automatically once the image is received.\n\n" +
+        "Attach an image to a message in **this channel** and send it.\n" +
+        "Only the **raid owner** or a **Raid Handler** can submit it.\n\n" +
         "*(Click **✅ Confirm & Send Summary** at any time to skip the screenshot.)*",
       flags: 64
     });
@@ -665,11 +861,10 @@ async function handleButton(interaction, client) {
 
   // ── Confirm end ──
   if (customId === "raid_confirm_end") {
-    const pending = pendingEnds.get(interaction.channel.id);
+    const pending = pendingEnds.get(interaction.channel?.id);
     if (!pending) return interaction.reply({ content: "❌ No pending raid end.", flags: 64 });
 
-    // Respond FIRST — nothing async before this
-    await interaction.update({ content: "⏳ Sending summary...", embeds: [], components: [] });
+    await interaction.deferUpdate();
 
     const { raid, durationMs, screenshotUrl } = pending;
     const extraRaiders = pending.selectedUsers || [];
@@ -677,34 +872,153 @@ async function handleButton(interaction, client) {
     activeRaids.delete(interaction.channel.id);
     refreshPaused.delete(interaction.channel.id);
 
-    // Slow work after interaction is already handled
     await finaliseRaid(interaction.guild, client, raid, durationMs, extraRaiders, screenshotUrl);
     setTimeout(() => interaction.channel.delete().catch(() => {}), 4000);
     return true;
   }
 
-  // ── Skip end (backward compat) ──
-  if (customId === "raid_skip_end") {
-    const pending = pendingEnds.get(interaction.channel.id);
-    if (!pending) return interaction.reply({ content: "❌ No pending raid end.", flags: 64 });
+  // ── Note send buttons ──
+  if (["note_send_ingame", "note_send_inposition", "note_send_both"].includes(customId)) {
+    await interaction.deferUpdate();
 
-    await interaction.update({ content: "⏳ Sending summary...", embeds: [], components: [] });
+    let raid = interaction.channel ? activeRaids.get(interaction.channel.id) : null;
 
-    const { raid, durationMs } = pending;
-    pendingEnds.delete(interaction.channel.id);
-    activeRaids.delete(interaction.channel.id);
-    refreshPaused.delete(interaction.channel.id);
+    if (!raid) {
+      for (const [, r] of activeRaids) {
+        if (r.pendingNote && r.pendingNote.authorId === interaction.user.id) {
+          raid = r;
+          break;
+        }
+      }
+    }
 
-    await finaliseRaid(interaction.guild, client, raid, durationMs, [], null);
-    setTimeout(() => interaction.channel.delete().catch(() => {}), 4000);
+    if (!raid) {
+      await interaction.editReply({ content: "❌ No active raid found.", embeds: [], components: [] });
+      return true;
+    }
+
+    if (!hasRole(interaction.member, process.env.RAID_LEADER_ROLE_ID)) {
+      await interaction.editReply({ content: "❌ Only Raid Leaders can send notes.", embeds: [], components: [] });
+      return true;
+    }
+
+    if (!raid.pendingNote) {
+      await interaction.editReply({ content: "❌ No note ready. Click the 📝 Note button first.", embeds: [], components: [] });
+      return true;
+    }
+
+    const { text } = raid.pendingNote;
+    raid.pendingNote = null;
+
+    const noteEmbed = new EmbedBuilder()
+      .setColor(COLOURS.note)
+      .setTitle("📝 Note from Raid Leader")
+      .setDescription(text)
+      .setFooter({ text: "Sent by Raid Leader" })
+      .setTimestamp();
+
+    let targets = [];
+    if (customId === "note_send_ingame")     targets = [...(raid.members?.ingame || [])];
+    if (customId === "note_send_inposition") targets = [...(raid.members?.inposition || []).map(e => e.userId)];
+    if (customId === "note_send_both")       targets = [...new Set([...(raid.members?.ingame || []), ...(raid.members?.inposition || []).map(e => e.userId)])];
+
+    let sent = 0;
+    for (const userId of targets) {
+      const member = await safeFetchMember(interaction.guild, userId);
+      if (!member) continue;
+      const ok = await member.user.send({ embeds: [noteEmbed] }).catch(() => null);
+      if (ok) sent++;
+    }
+
+    await interaction.editReply({
+      content: `✅ Note sent to **${sent}** member(s).`,
+      embeds: [],
+      components: []
+    });
     return true;
   }
 
-  // All remaining buttons require an active raid in this channel
-  const raid = activeRaids.get(interaction.channel?.id);
+  // ── Want to Swap Acc ──
+  if (customId === "want_swap_account") {
+    await interaction.deferReply({ flags: 64 });
+
+    const raid = findRaidForInteraction(interaction);
+    const raidChannelId = raid ? findRaidChannelId(raid) : null;
+
+    const userName = interaction.user.displayName ?? interaction.user.username;
+
+    if (raidChannelId && raid) {
+      try {
+        const raidChannel = await client.channels.fetch(raidChannelId).catch(() => null);
+        if (raidChannel) {
+          await raidChannel.send({
+            content:
+              `🔄 **${userName}** is looking to **swap their account**!\n` +
+              `> If you'd like to swap, reply to this message or DM **${userName}** directly.`,
+            allowedMentions: { parse: [] }
+          });
+        }
+      } catch {}
+    }
+
+    if (raid) {
+      const roleId = process.env.RAID_ROLE_ID;
+      if (roleId) {
+        const guild = interaction.guild || await client.guilds.fetch(process.env.GUILD_ID).catch(() => null);
+        if (guild) {
+          const members = await fetchRoleMembers(guild, roleId);
+          for (const [, member] of members) {
+            if (member.id === interaction.user.id) continue;
+            await member.user.send({
+              content:
+                `🔄 **${userName}** is looking to **swap their account**!\n` +
+                `> If you'd like to swap, DM **${userName}** directly.`,
+              allowedMentions: { parse: [] }
+            }).catch(() => {});
+          }
+        }
+      }
+    }
+
+    await interaction.editReply({ content: "✅ Swap request sent to all raiders!" });
+    return true;
+  }
+
+  // ── Find raid for remaining buttons ──
+  const raid = findRaidForInteraction(interaction);
+  const raidChannelId = raid ? findRaidChannelId(raid) : null;
+
+  // ── Raid Note (open modal) ──
+  if (customId === "raid_note") {
+    if (!hasRole(interaction.member, process.env.RAID_LEADER_ROLE_ID)) {
+      return interaction.reply({ content: "❌ Only Raid Leaders can send notes.", flags: 64 });
+    }
+
+    if (!raid) return interaction.reply({ content: "❌ No active raid in this channel.", flags: 64 });
+
+    const modal = new ModalBuilder()
+      .setCustomId(`note_modal_${raidChannelId}`)
+      .setTitle("📝 Send Note to Raiders");
+
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("note_text")
+          .setLabel("Note message")
+          .setStyle(TextInputStyle.Paragraph)
+          .setPlaceholder("Type your note here...")
+          .setRequired(true)
+          .setMaxLength(1500)
+      )
+    );
+
+    await interaction.showModal(modal);
+    return true;
+  }
+
   if (!raid) return false;
 
-  // ===== RAID PING =====
+  // ── Raid Ping ──
   if (customId === "raid_ping") {
     const now      = Date.now();
     const cooldown = 5 * 60 * 1000;
@@ -718,67 +1032,72 @@ async function handleButton(interaction, client) {
 
     raid.lastPing = now;
     await interaction.deferReply({ flags: 64 });
-    await interaction.channel.send({
-      content: `🚨 RAID ALERT <@&${process.env.RAID_ROLE_ID}>`,
-      allowedMentions: { roles: [process.env.RAID_ROLE_ID] }
-    });
-    await interaction.editReply({ content: "✅ Raid Ping Sent" });
+
+    const pingChannel = raidChannelId ? await client.channels.fetch(raidChannelId).catch(() => null) : interaction.channel;
+    if (pingChannel) {
+      await pingChannel.send({
+        content: `🚨 **RAID ALERT** <@&${process.env.RAID_ROLE_ID}> — Get in now!`,
+        allowedMentions: { roles: [process.env.RAID_ROLE_ID] }
+      });
+    }
+    await interaction.editReply({ content: "✅ Raid Ping Sent!" });
     return true;
   }
 
-  // ===== END RAID =====
+  // ── End Raid ──
   if (customId === "end_raid") {
+    await interaction.deferReply({ flags: 64 });
+
     const isOwner   = interaction.user.id === raid.owner;
     const isHandler = hasRole(interaction.member, process.env.RAID_HANDLER_ROLE_ID);
 
     if (!isOwner && !isHandler) {
-      return interaction.reply({
-        content: "❌ Only the raid owner or a Raid Handler can end this raid.",
-        flags: 64
-      });
+      await interaction.editReply({ content: "❌ Only the raid owner or a Raid Handler can end this raid." });
+      return true;
     }
 
     const durationMs = Date.now() - raid.startTime;
-    pendingEnds.set(interaction.channel.id, {
-      raid,
-      durationMs,
-      selectedUsers:    [],
-      screenshotUrl:    null,
-      awaitingScreenshot: false
+    pendingEnds.set(raidChannelId, {
+      raid, durationMs,
+      selectedUsers: [], screenshotUrl: null, awaitingScreenshot: false
     });
+    refreshPaused.add(raidChannelId);
 
-    refreshPaused.add(interaction.channel.id);
-
-    // Reply FIRST
-    await interaction.reply({
-      content:
-        "## 🏁 Raid Ending\n" +
-        "Select any **additional raiders** to add to the summary, then click Confirm.\n" +
-        "You can also optionally attach a **Raid Screenshot** before confirming.",
-      components: getRaiderSelectRow(),
-      flags: 64
-    });
-
-    // Freeze the panel so nobody clicks during end flow
     try {
-      if (raid.messageId) {
-        const panelMsg = await interaction.channel.messages.fetch(raid.messageId).catch(() => null);
-        if (panelMsg) await panelMsg.edit({ components: [] }).catch(() => {});
-      }
-      if (raid.memberActionMessageId) {
-        const memberMsg = await interaction.channel.messages.fetch(raid.memberActionMessageId).catch(() => null);
-        if (memberMsg) await memberMsg.edit({ components: [] }).catch(() => {});
+      const raidChannel = await client.channels.fetch(raidChannelId).catch(() => null);
+      if (raidChannel) {
+        if (raid.messageId) {
+          const panelMsg = await raidChannel.messages.fetch(raid.messageId).catch(() => null);
+          if (panelMsg) await panelMsg.edit({ embeds: [buildEmbed(raid)], components: [] }).catch(() => {});
+        }
+        if (raid.memberActionMessageId) {
+          const memberMsg = await raidChannel.messages.fetch(raid.memberActionMessageId).catch(() => null);
+          if (memberMsg) await memberMsg.edit({ components: [] }).catch(() => {});
+        }
+        if (raid.statusMessageId) {
+          const statusMsg = await raidChannel.messages.fetch(raid.statusMessageId).catch(() => null);
+          if (statusMsg) await statusMsg.edit({ embeds: [buildStatusEmbed(raid)] }).catch(() => {});
+        }
       }
     } catch {}
+
+    await interaction.editReply({
+      content:
+        "## 🏁 Raid Ending\n" +
+        "Use the selector below to add any **additional raiders** to the summary.\n" +
+        "Optionally attach a **Raid Screenshot**, then click **Confirm**.\n\n" +
+        "📸 To add a screenshot: click **Add Raid Screenshot** then send an image **in this channel**.",
+      components: getRaiderSelectRow()
+    });
 
     return true;
   }
 
-  // ===== EDIT RAID =====
+  // ── Edit Raid ──
   if (customId === "edit_raid") {
     const d     = raid.data;
     const modal = new ModalBuilder()
-      .setCustomId(`edit_raid_${interaction.channel.id}`)
+      .setCustomId(`edit_raid_${raidChannelId}`)
       .setTitle("Edit Raid");
 
     modal.addComponents(
@@ -792,59 +1111,79 @@ async function handleButton(interaction, client) {
         new TextInputBuilder().setCustomId("enemies").setLabel("Enemies").setStyle(TextInputStyle.Short).setValue(d.enemies)
       ),
       new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId("link").setLabel("Link").setStyle(TextInputStyle.Short).setValue(d.link)
+        new TextInputBuilder().setCustomId("link").setLabel("Server Link").setStyle(TextInputStyle.Short).setValue(d.link)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId("difficulty")
+          .setLabel("Difficulty")
+          .setStyle(TextInputStyle.Short)
+          .setValue(d.difficulty || "")
+          .setRequired(false)
       )
     );
 
-    // showModal MUST be the first and only response
     await interaction.showModal(modal);
     return true;
   }
 
-  // ===== IN GAME TOGGLE =====
+  // ── In Game Toggle ──
   if (customId === "member_ingame") {
+    await interaction.deferReply({ flags: 64 });
+
     const userId = interaction.user.id;
     const ingame = raid.members.ingame;
-    const idx    = ingame.indexOf(userId);
+    const inpos  = raid.members.inposition;
 
-    if (raid.members.queue[userId] !== undefined) delete raid.members.queue[userId];
+    const posIdx = inpos.findIndex(e => e.userId === userId);
+    if (posIdx !== -1) {
+      inpos.splice(posIdx, 1);
+      const guild = interaction.guild || await client.guilds.fetch(process.env.GUILD_ID).catch(() => null);
+      if (guild) await removeMemberRole(guild, userId, process.env.IN_POSITION_ROLE_ID);
+    }
 
+    const idx   = ingame.indexOf(userId);
     const nowIn = idx === -1;
-    if (nowIn) ingame.push(userId);
-    else ingame.splice(idx, 1);
+    if (nowIn) {
+      ingame.push(userId);
+      const guild = interaction.guild || await client.guilds.fetch(process.env.GUILD_ID).catch(() => null);
+      if (guild) await assignMemberRole(guild, userId, process.env.IN_GAME_ROLE_ID);
+    } else {
+      ingame.splice(idx, 1);
+      const guild = interaction.guild || await client.guilds.fetch(process.env.GUILD_ID).catch(() => null);
+      if (guild) await removeMemberRole(guild, userId, process.env.IN_GAME_ROLE_ID);
+    }
 
-    // Reply FIRST
-    await interaction.reply({
-      content: nowIn ? "✅ You're marked **In Game**" : "❎ You're no longer **In Game**",
-      flags: 64
+    await interaction.editReply({
+      content: nowIn ? "✅ You're marked **In Game**!" : "❎ You're no longer **In Game**."
     });
 
-    // Channel status + DMs instantly
-    await updateStatusEmbed(client, interaction.channel.id, raid);
-    dmAllRaiders(interaction.guild, raid, true).catch(console.error);
+    if (raidChannelId) await updateStatusEmbed(client, raidChannelId, raid);
+
+    const guild = interaction.guild || await client.guilds.fetch(process.env.GUILD_ID).catch(() => null);
+    if (guild) dmAllRaiders(guild, raid, true).catch(console.error);
     return true;
   }
 
-  // ===== QUEUE POSITION =====
-  if (customId === "member_queue") {
+  // ── In Position Toggle ──
+  if (customId === "member_inposition") {
     const modal = new ModalBuilder()
-      .setCustomId(`queue_modal_${interaction.channel.id}`)
-      .setTitle("Set Queue Position");
+      .setCustomId(`inposition_modal_${raidChannelId}`)
+      .setTitle("📍 Set Your Position");
 
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
-          .setCustomId("queue_number")
-          .setLabel("Enter your position (1–50)")
+          .setCustomId("position_slot")
+          .setLabel("Your position number (e.g. 4)")
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder("e.g. 12")
+          .setPlaceholder("Enter a number like 1, 2, 3...")
+          .setRequired(true)
           .setMinLength(1)
           .setMaxLength(2)
-          .setRequired(true)
       )
     );
 
-    // showModal MUST be first — no awaits before it
     await interaction.showModal(modal);
     return true;
   }
@@ -852,29 +1191,7 @@ async function handleButton(interaction, client) {
   return false;
 }
 
-// ===== HANDLE SELECT MENU =====
-async function handleSelectMenu(interaction) {
-  if (interaction.customId !== "raid_raider_select") return false;
-
-  const pending = pendingEnds.get(interaction.channel.id);
-  if (!pending) {
-    await interaction.reply({ content: "❌ No pending raid end found.", flags: 64 });
-    return true;
-  }
-
-  pending.selectedUsers = interaction.values || [];
-
-  await interaction.reply({
-    content: `✅ **${pending.selectedUsers.length}** extra raider(s) selected. Click **Confirm & Send Summary** when ready.`,
-    flags: 64
-  });
-  return true;
-}
-
-// ===== LIVE CHANNEL PANEL REFRESH (60s) =====
-// This only refreshes the CHANNEL panel display — DMs are always updated
-// instantly through dmAllRaiders() calls after every mutation above.
-// FIX 3: No member fetches here — pure channel message operations only.
+// ===== LIVE REFRESH (60s) =====
 function startRefresh(client) {
   setInterval(async () => {
     for (const [channelId, raid] of activeRaids.entries()) {
@@ -901,20 +1218,25 @@ function startRefresh(client) {
         const old = await channel.messages.fetch(raid.memberActionMessageId).catch(() => null);
         if (old) await old.delete().catch(() => {});
       }
-      const memberMsg = await channel.send({ components: getMemberActionRow() });
+      const joinRow   = buildJoinRow(raid.data.link);
+      const memberMsg = await channel.send({ components: [...joinRow, ...getMemberActionRow()] });
       raid.memberActionMessageId = memberMsg.id;
     }
   }, 60000);
 }
+
+function startQueueChecker(client) {}
 
 module.exports = {
   activeRaids,
   createRaid,
   handleRaidModal,
   handleEditModal,
-  handleQueueModal,
+  handleNoteModal,
+  handleInPositionModal,
   handleButton,
   handleSelectMenu,
   handleMessage,
-  startRefresh
+  startRefresh,
+  startQueueChecker
 };
